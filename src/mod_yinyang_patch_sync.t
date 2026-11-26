@@ -1,10 +1,18 @@
-! Cached same-patch copies on a fixed level-one grid. No averaging of EMFs.
+! Cached same-patch copies on a native grid level. No averaging of EMFs.
 module mod_yinyang_patch_sync
   use mpi
   implicit none
   private
   integer,parameter,public :: yy_sync_edges=1,yy_sync_faces=2,yy_sync_extended_faces=3
   public :: yy_patch_copy_plan,yy_patch_copy_build,yy_patch_copy_exchange
+  abstract interface
+    subroutine yy_patch_owner(block,idx,c,edge,rank,id)
+      integer,intent(inout) :: block(3)
+      integer,intent(in) :: idx(3),c
+      logical,intent(in) :: edge
+      integer,intent(out) :: rank,id
+    end subroutine
+  end interface
   type yy_patch_copy_plan
     integer :: comm=MPI_COMM_NULL
     integer,allocatable :: receivers(:,:),request(:,:),sc(:),rc(:),sd(:),rd(:)
@@ -24,9 +32,10 @@ contains
   ! Receivers/requests: local ID, zero-based local cell indices, component.
   ! A staggered upper face/edge at an internal interface belongs to the lower
   ! block in each transverse direction. Ownership never depends on MPI rank.
-  subroutine yy_patch_copy_build(plan,comm,patch,kind,bn,nn,halo,directory)
+  subroutine yy_patch_copy_build(plan,comm,patch,kind,bn,nn,halo,directory,owner_lookup)
     type(yy_patch_copy_plan),intent(out) :: plan
     integer,intent(in) :: comm,patch,kind,bn(3),nn(3),halo,directory(:,:)
+    procedure(yy_patch_owner),optional :: owner_lookup
     integer :: np,rank,ierr,nb(3),n,p,c,d,i,j,k,pass,nr,slot,idx(3),gi(3),bc(3),src(3),didx(3)
     integer :: lo(3),hi(3),amin(3),global_min(3),global_max(3),source_id,source_rank
     integer,allocatable :: owners(:,:,:,:),ids(:,:,:,:),cursor(:),out(:,:)
@@ -36,16 +45,18 @@ contains
     if(any(bn<=0).or.any(nn<=0).or.halo<0) call fail(comm,'invalid grid dimensions')
     if(any(mod(nn,bn)/=0).or.size(directory,1)/=6) call fail(comm,'invalid block directory shape')
     nb=nn/bn;plan%comm=comm
-    allocate(owners(0:nb(1)-1,0:nb(2)-1,0:nb(3)-1,0:1),ids(0:nb(1)-1,0:nb(2)-1,0:nb(3)-1,0:1))
-    owners=-1;ids=-1
-    do n=1,size(directory,2)
-      bc=directory(1:3,n);p=directory(6,n)
-      if(any(bc<0).or.any(bc>=nb).or.p<0.or.p>1) call fail(comm,'invalid directory coordinate')
-      if(directory(4,n)<1.or.directory(5,n)<0.or.directory(5,n)>=np) call fail(comm,'invalid block owner')
-      if(owners(bc(1),bc(2),bc(3),p)/=-1) call fail(comm,'duplicate block coordinate')
-      owners(bc(1),bc(2),bc(3),p)=directory(5,n);ids(bc(1),bc(2),bc(3),p)=directory(4,n)
-    end do
-    if(any(owners<0)) call fail(comm,'incomplete level-one mesh')
+    if(.not.present(owner_lookup)) then
+      allocate(owners(0:nb(1)-1,0:nb(2)-1,0:nb(3)-1,0:1),ids(0:nb(1)-1,0:nb(2)-1,0:nb(3)-1,0:1))
+      owners=-1;ids=-1
+      do n=1,size(directory,2)
+        bc=directory(1:3,n);p=directory(6,n)
+        if(any(bc<0).or.any(bc>=nb).or.p<0.or.p>1) call fail(comm,'invalid directory coordinate')
+        if(directory(4,n)<1.or.directory(5,n)<0.or.directory(5,n)>=np) call fail(comm,'invalid block owner')
+        if(owners(bc(1),bc(2),bc(3),p)/=-1) call fail(comm,'duplicate block coordinate')
+        owners(bc(1),bc(2),bc(3),p)=directory(5,n);ids(bc(1),bc(2),bc(3),p)=directory(4,n)
+      end do
+      if(any(owners<0)) call fail(comm,'incomplete level-one mesh')
+    end if
     allocate(plan%sc(np),plan%rc(np),plan%sd(np),plan%rd(np),cursor(np));plan%sc=0
     do pass=1,2
       nr=0
@@ -77,8 +88,13 @@ contains
                 end if
                 if(any(gi<global_min).or.any(gi>global_max)) cycle
                 src=max(0,min(nb-1,gi/bn))
-                source_rank=owners(src(1),src(2),src(3),patch)
-                source_id=ids(src(1),src(2),src(3),patch)
+                if(present(owner_lookup)) then
+                  call owner_lookup(src,gi,c,kind==yy_sync_edges,source_rank,source_id)
+                else
+                  source_rank=owners(src(1),src(2),src(3),patch)
+                  source_id=ids(src(1),src(2),src(3),patch)
+                end if
+                if(source_rank<0) cycle
                 if(source_rank==rank.and.source_id==directory(4,n)) cycle
                 didx=gi-src*bn
                 if(any(didx<lo).or.any(didx>hi)) call fail(comm,'source outside stored stencil')

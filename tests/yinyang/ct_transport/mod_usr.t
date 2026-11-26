@@ -8,7 +8,7 @@ module mod_usr
   implicit none
   logical :: initialized=.false.
   logical :: native_control=.false.,save_samples=.false.
-  integer :: reference_patch=0,frame_patch=0
+  integer :: reference_patch=0,frame_patch=0,refined_patches=0
   integer :: direction=1,placement=1
   double precision :: amplitude=1.d-3,radius=0.35d0,origin(3),velocity(3),normal(3),a0
   integer :: stage_calls=0,last_iteration=-1,history_unit,test_world_rank
@@ -17,7 +17,7 @@ contains
   subroutine usr_init()
     integer :: n
     double precision :: phi
-    namelist /transport_test/ direction,placement,amplitude,radius,native_control,reference_patch,save_samples
+    namelist /transport_test/ direction,placement,amplitude,radius,native_control,reference_patch,save_samples,refined_patches
     do n=1,size(par_files)
       open(unitpar,file=trim(par_files(n)),status='old')
       read(unitpar,transport_test,end=10)
@@ -40,6 +40,7 @@ contains
     if(native_control)usr_special_bc=>native_fluid_boundary
     usr_init_one_grid=>initial
     usr_init_vector_potential=>potential
+    if(refined_patches/=0) usr_refine_grid=>transport_refine
     usr_ct_stage=>stage_diagnostic
     usr_process_global=>diagnostic
     usr_process_adv_global=>advanced
@@ -99,6 +100,14 @@ contains
       A(ix^D)=dot_product(cart,frame(:,idir))
     {end do\}
   end subroutine
+  subroutine transport_refine(g,level,ixI^L,ixO^L,qt,w,x,refine,coarsen)
+    integer,intent(in) :: g,level,ixI^L,ixO^L
+    double precision,intent(in) :: qt,w(ixI^S,nw),x(ixI^S,ndim)
+    integer,intent(inout) :: refine,coarsen
+    coarsen=-1
+    refine=merge(1,-1,btest(refined_patches,yy_patch))
+  end subroutine
+
   subroutine stage_diagnostic(qt,qdt,sCT,s,fluxes)
     double precision,intent(in) :: qt,qdt
     type(state),intent(in) :: sCT(max_blocks),s(max_blocks)
@@ -139,6 +148,7 @@ contains
     bn=[block_nx1,block_nx2,block_nx3];nn=[domain_nx1,domain_nx2,domain_nx3]
     do n=1,igridstail
       g=igrids(n);block=>ps(g)
+      nn=[domain_nx1,domain_nx2,domain_nx3]*2**(block%level-1)
       bc=[node(pig1_,g)-1,node(pig2_,g)-1,node(pig3_,g)-1]
       if(.not.all(ieee_is_finite(ps(g)%w)))call mpistop('nonfinite static-test state')
       call get_divb(ps(g)%w,ixG^LL,ixG^LL,divb)
@@ -221,7 +231,7 @@ contains
       end do
       close(u)
     end if
-    if(iit==it_max)then
+    if(iit==it_max.and.(refined_patches==0.or.refined_patches==3))then
       write(name,'(a,i0,a)')'transport-rank-',test_world_rank,'.txt'
       open(newunit=u,file=trim(name),status='replace')
       do n=1,igridstail

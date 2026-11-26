@@ -258,7 +258,7 @@ module mod_global_parameters
   !> The MPI communicator
   logical :: yinyang_enabled=.false.
   logical :: yy_radial_boundary_adjust=.false.
-  ! Experimental fixed-grid UCT-HLL integration; disabled by default.
+  ! Experimental Yin-Yang UCT-HLL integration; disabled by default.
   logical :: yy_ct_experimental=.false.
   integer :: yy_patch=0, yy_world_rank=0, yy_world_size=1
   integer :: icomm
@@ -777,6 +777,8 @@ module mod_global_parameters
   !> removed later. Disabled by default; set this to true to opt in.
   logical :: ghostcell_comm_batched=.false.
   integer :: ghostcell_comm_batch_size=64
+  !> Receive remote sibling cell data into contiguous, reusable storage.
+  logical :: ghostcell_sibling_recv_buffer=.false.
   !> True for record electric field
   logical :: record_electric_field=.false.
 

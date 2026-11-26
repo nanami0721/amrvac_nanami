@@ -126,10 +126,13 @@ program check_schedule
     if(rank==0) write(*,'(a,5i8,2es26.17)') 'RESULT ',scale,family,mode,caseid,total,peak,sqrt(globalerr/(3*total))
   end do
   close(u)
-  ! Rebuild and exercise no-local-receiver ranks with nonempty donor traffic.
+  ! Duplicate a covered target on one rank; the other ranks only serve donors.
   call yy_staggered_clear(table)
   if(rank==0) then
-    call yy_staggered_build(table,MPI_COMM_WORLD,patch,family,bn,nn,radial,angular,directory,points(:,:1))
+    points(:,2)=points(:,1)
+    call yy_staggered_build(table,MPI_COMM_WORLD,patch,family,bn,nn,radial,angular,directory,points(:,:2))
+    if(sum(table%sc)/=table%stencil) bad=bad+1
+    if(any(table%slot(:,1)/=table%slot(:,2))) bad=bad+1
   else
     call yy_staggered_build(table,MPI_COMM_WORLD,patch,family,bn,nn,radial,angular,directory,points(:,:0))
   end if
@@ -139,6 +142,7 @@ program check_schedule
   end do
   call yy_staggered_exchange(table,samples,value)
   if(rank==0) then
+    if(any(value(:,1)/=value(:,2))) bad=bad+1
     if(maxval(abs(value(:,1)-[0.2d0,-0.3d0,0.5d0]))>1.d-12) bad=bad+1
   end if
   call yy_staggered_clear(table)

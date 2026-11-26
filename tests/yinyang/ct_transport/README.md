@@ -4,6 +4,11 @@ This test advances full ideal MHD using native staged UCT-HLL, SSPRK3,
 TVDLF, and van Leer reconstruction. It does not reset velocity, inject
 analytic EMFs, or replace evolved magnetic fields. Only test files are added.
 
+Pass `--internal-energy` to `run.py` to exercise the same transport case with
+`mhd_internal_e=T`. Use a separate external work directory for each energy
+formulation. The pilot checks all three CT stages, pressure positivity and
+active-cell magnetic divergence through step 300.
+
 ## Reference and path
 
 Set rho=1, p=0.1, |v|=1, R=0.35, and peak analytic |B|=epsilon=1e-3.

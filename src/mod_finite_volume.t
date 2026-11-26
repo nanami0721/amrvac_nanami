@@ -114,7 +114,7 @@ contains
 
   !> finite volume method
   subroutine finite_volume(method,qdt,dtfactor,ixI^L,ixO^L,idims^LIM, &
-       qtC,sCT,qt,snew,fC,fE,dxs,x,ct_phase)
+       qtC,sCT,qt,snew,fC,fE,dxs,x,ct_phase,ct_work)
     use mod_physics
     use mod_variables
     use mod_global_parameters
@@ -156,7 +156,12 @@ contains
     !> undivided divergence of v at the interface, for the B19 diffusive flux
     double precision, dimension(ixI^S) :: divvC
     logical :: active=.false., need_hd_mom_flux=.false.
-    type(ct_velocity) :: vcts
+    type(ct_velocity), optional, target, intent(inout) :: ct_work
+    type(ct_velocity), target :: local_vcts
+    type(ct_velocity), pointer :: vcts
+
+    vcts => local_vcts
+    if(present(ct_work)) vcts => ct_work
 
     phase=ct_stage_full
     if(present(ct_phase)) phase=ct_phase

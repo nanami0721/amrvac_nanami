@@ -1,8 +1,8 @@
 # Yin–Yang tests
 
 New Mac Studio / new developer: start with the repository-root
-[handoff guide](../../YINYANG_MAC_STUDIO_HANDOFF.md). It distinguishes current
-capabilities, pending CT restart/application work, and a cache-free bootstrap.
+[handoff guide](../../YINYANG_MAC_STUDIO_HANDOFF.md) for the current
+capabilities and a cache-free bootstrap.
 
 See `doc/yinyang_v1.md` for scope, geometry, restart and validation details.
 Never compile or run inside this source tree. `run_validation.py` copies the
@@ -24,3 +24,14 @@ implementation and measured costs.
 `interface_transport/` adds exact forward/reverse entropy and force-free magnetic
 transport, three-resolution seam convergence, interior controls and seam-inclusive
 divergence diagnostics. Results: `doc/yinyang_interface_validation.md`.
+
+The `glm_amr/` regression exercises two-level interior refinement and
+coarsening, migration, paired restart and fixed-grid and native spherical
+controls. The `glm_amr_cross/` regression exercises refinement on the seam,
+the one-level stencil bound, mixed-level transfer and physical radial corners.
+Both use the same GLM AMR path.
+
+
+The [CT AMR fixture](ct_amr/README.md) covers interior refine/evolve/coarsen,
+fully matched fine levels, cross-level transport, a dynamic L4 seam and a
+prescribed inner-wall edge test at a coarse/fine seam junction.

@@ -16,7 +16,9 @@ contains
     integer :: igrid, iigrid, ixCoG^L
     logical, dimension(:,:), allocatable :: refine2
 
-    if (igridstail==0) return
+    ! A Yin-Yang rank can be empty after Morton partitioning and must still
+    ! join the patch reduction of refinement-buffer flags below.
+    if (igridstail==0.and..not.yinyang_enabled) return
 
     select case (refine_criterion)
     case (1) 

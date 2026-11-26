@@ -37,9 +37,9 @@ Cartesian vectors. Receiver counts may differ or be zero; all ranks must call.
 The tables retain request lists, peer counts/displacements, reconstruction
 coefficients and communication buffers. Repeated calls do not allocate storage.
 `yy_staggered_clear` releases them. The caller must rebuild after restart or any
-mesh/ownership change; these tables are not checkpoint state. Requests are not
-yet deduplicated; do not infer production communication efficiency from these
-small analytic tests.
+mesh/ownership change; these tables are not checkpoint state. Each receiving rank requests a given block, index and component once from
+each donor rank. Targets sharing a sample keep their own coefficients and
+refer to the same receive slot.
 
 ## Reconstruction used for validation
 

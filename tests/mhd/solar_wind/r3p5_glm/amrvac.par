@@ -1,0 +1,81 @@
+&filelist
+       base_filename='data/polytropic'
+       firstprocess=.false.
+       saveprim=.true.
+       nwauxio=12
+       convert_type='vtuBCCmpi'
+ /
+
+&savelist
+        ditsave_log=1
+        dtsave_dat=0.08d0
+        itsave(1,1)=0
+        itsave(1,2)=0
+ /
+
+&stoplist
+        final_dt_reduction=.true.
+        time_max=7.0d0
+ /
+
+&methodlist
+        time_stepper='threestep'
+        flux_scheme=20*'hll'
+        limiter=20*'minmod'
+        small_density = 1.0d-7
+        small_pressure = 1.0d-7
+        small_values_method = 'replace'
+        fix_small_values=.true.
+        check_small_values=.true.
+ /
+
+&boundlist
+        typeboundary_min1=8*'special'
+        typeboundary_max1=8*'special'
+        typeboundary_min2=8*'cont'
+        typeboundary_max2=8*'cont'
+        typeboundary_min3=8*'cont'
+        typeboundary_max3=8*'cont'
+ /
+
+&meshlist
+        max_blocks=128
+        refine_criterion=3
+        refine_max_level=4
+        refine_threshold=0.2d0,0.3d0,0.3d0,0.4d0,16*0.2d0
+        derefine_ratio=20*0.1d0
+        w_refine_weight(4)=0.4d0
+        w_refine_weight(5)=0.3d0
+        w_refine_weight(6)=0.3d0
+        block_nx1  =     20
+        block_nx2  = 16
+        block_nx3  =     20
+        domain_nx1 =     500
+        domain_nx2 = 96
+        domain_nx3 = 280
+        xprobmin1  =     1.0d0
+        xprobmax1  =     3.5d0
+        xprobmin2  = 0.11666666666666667
+        xprobmax2  = 0.38333333333333336
+        xprobmin3  = -0.3888888888888889
+        xprobmax3  = 0.3888888888888889
+        ditregrid  =     10000000
+ /
+
+&paramlist
+        typecourant='maxsum'
+        courantpar=0.5d0
+ /
+
+&mhd_list
+        mhd_energy=.true.
+        mhd_viscosity=.false.
+        mhd_gravity=.true.
+        typedivbfix='glm'
+        boundary_divbfix_skip(1)=1
+        boundary_divbfix_skip(2)=1
+        mhd_internal_e         = .true.
+ /
+&eos_list
+ gamma=1.05d0
+/

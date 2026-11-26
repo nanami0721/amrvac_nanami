@@ -52,6 +52,15 @@ for arch in ['debug','default']:
     (r/'results.json').write_text(json.dumps(results,indent=2))
    keys=[f'{arch}-stretch{int(stretch)}-{layout}-np{x}' for x in [2,4,6]]
    assert len({results[k]['sha256'] for k in keys})==1
+ # Exercise the internal-energy synchronization on the same active, ghost and corner cells.
+ name='internal-sync-'+arch
+ out=r/name;out.mkdir()
+ (out/'amrvac.par').write_text(config.replace('&mhd_list','&mhd_list\n mhd_internal_e=T'))
+ job(name,['mpirun','--oversubscribe','-np',2,d/'amrvac'],out)
+ mem=r/(name+'-memory')
+ assert (mem/'command.err').stat().st_size==0
+ row,=[line.split() for line in (mem/'command.log').read_text().splitlines() if line.startswith('CT_BOUNDARY_SYNC ')]
+ assert int(row[1])==0 and float(row[7])==0.0
  # Invalid receiver must fail before any collective exchange, without hanging.
  for problem,label,diagnostic in [(1,'nonowner','CT overset receiver must be the geometric owner'),(2,'split-energy','CT energy sync requires unsplit classical total-energy MHD')]:
   name='reject-'+label+'-'+arch;out=r/name;out.mkdir();shutil.copy2(d/'amrvac',out/'amrvac')
@@ -64,7 +73,5 @@ for arch in ['debug','default']:
   assert json.loads((r/(name+'-memory/summary.json')).read_text())['stop_reason'] is None
   print(name,'expected rejection',flush=True)
 for nd,nv in [(1,1),(1,2),(1,3),(2,2),(2,3),(3,3)]:
- d=b/'lib'/f'{nd}d{nv}_debug'
- env.update(NDIM=str(nd),NDIR=str(nv),ARCH='debug')
- job(f'matrix-{nd}d{nv}',['make',compiler,'-j1','-f',b/'arch/lib.make','libamrvac'],d,4096)
+ job(f'matrix-{nd}d{nv}',['make',compiler,'-j1','ARCH=debug',f'{nd}d{nv}'],b/'lib',4096)
 print('Mesh integration and full-library dimension checks passed',flush=True)

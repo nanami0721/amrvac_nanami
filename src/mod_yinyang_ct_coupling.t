@@ -3,7 +3,7 @@ module mod_yinyang_ct_coupling
   use mpi
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   use mod_yinyang_staggered, only: yy_staggered_table, yy_staggered_build, &
-    yy_staggered_exchange, yy_staggered_basis, yy_edge_location, yy_face_location
+    yy_staggered_exchange, yy_staggered_basis, yy_edge_location, yy_face_location, yy_staggered_sources
   implicit none
   private
   public :: yy_ct_edge_plan, yy_ct_edge_build, yy_ct_edge_exchange, yy_ct_edge_clear
@@ -23,11 +23,12 @@ module mod_yinyang_ct_coupling
 contains
   ! Br is patch-invariant as a scalar; tangential components require rotation.
   ! This split permits radial wall faces without borrowing physical ghost data.
-  subroutine yy_ct_face_build(plan,comm,patch,bn,nn,radial,angular,directory,centers,directions,widths)
+  subroutine yy_ct_face_build(plan,comm,patch,bn,nn,radial,angular,directory,centers,directions,widths,sources)
     type(yy_ct_face_plan),intent(out) :: plan
     integer,intent(in) :: comm,patch,bn(3),nn(3),directory(:,:),directions(:)
     double precision,intent(in) :: radial(0:),angular(2,2),centers(:,:)
     double precision,optional,intent(in) :: widths(:,:)
+    procedure(yy_staggered_sources),optional :: sources
     double precision,allocatable :: rp(:,:),tp(:,:)
     double precision :: frame(3,3)
     integer :: n,nr,nt,ir,it,c
@@ -51,13 +52,13 @@ contains
     end do
     if(present(widths))then
       call yy_staggered_build(plan%radial,comm,patch,yy_face_location,bn,nn,radial,angular,directory,rp, &
-        face_widths=widths(:,plan%rslot),face_directions=directions(plan%rslot))
+        face_widths=widths(:,plan%rslot),face_directions=directions(plan%rslot),sources=sources)
       call yy_staggered_build(plan%tangent,comm,patch,yy_face_location,bn,nn,radial,angular,directory,tp, &
-        face_widths=widths(:,plan%tslot),face_directions=directions(plan%tslot))
+        face_widths=widths(:,plan%tslot),face_directions=directions(plan%tslot),sources=sources)
     else
       call yy_staggered_build(plan%radial,comm,patch,yy_face_location,bn,nn,radial,angular,directory,rp, &
-        radial_scalar=.true.)
-      call yy_staggered_build(plan%tangent,comm,patch,yy_face_location,bn,nn,radial,angular,directory,tp)
+        radial_scalar=.true.,sources=sources)
+      call yy_staggered_build(plan%tangent,comm,patch,yy_face_location,bn,nn,radial,angular,directory,tp,sources=sources)
     end if
     plan%covered(plan%rslot)=plan%radial%covered
     plan%covered(plan%tslot)=plan%tangent%covered
@@ -116,11 +117,12 @@ contains
     end do
   end subroutine
 
-  subroutine yy_ct_edge_build(plan,comm,patch,bn,nn,radial,angular,directory,centers,widths,directions,radial_extrapolate,native_midpoint)
+  subroutine yy_ct_edge_build(plan,comm,patch,bn,nn,radial,angular,directory,centers,widths,directions,radial_extrapolate,native_midpoint,sources)
     type(yy_ct_edge_plan),intent(inout) :: plan
     integer,intent(in) :: comm,patch,bn(3),nn(3),directory(:,:),directions(:)
     double precision,intent(in) :: radial(0:),angular(2,2),centers(:,:),widths(:)
     logical,optional,intent(in) :: radial_extrapolate,native_midpoint
+    procedure(yy_staggered_sources),optional :: sources
     double precision,allocatable :: points(:,:)
     integer,allocatable :: idmap(:)
     double precision :: pos(3,2),weights(3,2),r,step(2),frame(3,3),jacobian
@@ -152,32 +154,36 @@ contains
       end if
     end do
     call yy_staggered_build(plan%samples,comm,patch,yy_edge_location,bn,nn,radial,angular,directory,points, &
-      edge_radial_extrapolate=radial_extrapolate)
+      edge_radial_extrapolate=radial_extrapolate,sources=sources)
     ns=size(plan%samples%request,2)
     allocate(plan%donor_length(ns),plan%scaled(ns),plan%vectors(3,nq*nt))
-    call MPI_COMM_RANK(comm,rank,ierr)
-    allocate(idmap(maxval(directory(4,:))));idmap=0
-    do n=1,size(directory,2)
-      if(directory(5,n)==rank) idmap(directory(4,n))=n
-    end do
-    step=(angular(:,2)-angular(:,1))/nn(2:3)
-    do n=1,ns
-      g=plan%samples%request(1,n);ig=idmap(g);c=plan%samples%request(5,n)
-      idx=directory(1,ig)*bn(1)+plan%samples%request(2,n)
-      if(c==1) then
-        plan%donor_length(n)=radial(idx+1)-radial(idx)
-      else
-        r=radial(idx+1)
-        if(c==2) then
-          plan%donor_length(n)=r*step(1)
+    if(present(sources)) then
+      plan%donor_length=1.d0
+    else
+      call MPI_COMM_RANK(comm,rank,ierr)
+      allocate(idmap(maxval(directory(4,:))));idmap=0
+      do n=1,size(directory,2)
+        if(directory(5,n)==rank) idmap(directory(4,n))=n
+      end do
+      step=(angular(:,2)-angular(:,1))/nn(2:3)
+      do n=1,ns
+        g=plan%samples%request(1,n);ig=idmap(g);c=plan%samples%request(5,n)
+        idx=directory(1,ig)*bn(1)+plan%samples%request(2,n)
+        if(c==1) then
+          plan%donor_length(n)=radial(idx+1)-radial(idx)
         else
-          ! xy magnitude is invariant under Yin-Yang rotation only after
-          ! converting back to the donor patch; use its angular index instead.
-          idx=directory(2,ig)*bn(2)+plan%samples%request(3,n)
-          plan%donor_length(n)=r*sin(angular(1,1)+(idx+1)*step(1))*step(2)
+          r=radial(idx+1)
+          if(c==2) then
+            plan%donor_length(n)=r*step(1)
+          else
+            ! xy magnitude is invariant under Yin-Yang rotation only after
+            ! converting back to the donor patch; use its angular index instead.
+            idx=directory(2,ig)*bn(2)+plan%samples%request(3,n)
+            plan%donor_length(n)=r*sin(angular(1,1)+(idx+1)*step(1))*step(2)
+          end if
         end if
-      end if
-    end do
+      end do
+    end if
     if(any(plan%donor_length<=0.d0)) call edge_error(comm,'nonpositive donor edge length')
     do n=1,nt
       plan%covered(n)=all(plan%samples%covered(nq*(n-1)+1:nq*n))

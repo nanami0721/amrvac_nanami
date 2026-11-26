@@ -8,10 +8,10 @@ The default remains disabled; background-field splitting remains unsupported.
 
 `ct_stage_split=.true.` in `&methodlist` selects a two-pass update. The default is
 false, preserving the original block-at-a-time route. The experimental route
-requires 3D, fixed level-one meshes, global unsplit SSPRK3 stepping, TVDLF or HLL
-fluxes and UCT-HLL. AMR, load balancing and local timesteps are rejected. Only
-these combinations are covered by the stage test; this is not a blanket
-qualification of every MHD source/thermodynamic option.
+requires 3D, global unsplit SSPRK3 stepping, TVDLF or HLL fluxes and UCT-HLL.
+The standalone staged route uses a fixed level-one mesh. The explicit
+Yin–Yang CT route also accepts native AMR. Cost-weighted balancing and local
+timesteps are outside this configuration.
 
 Each active local block owns cached numerical face fluxes and time-integrated
 edge electromotive forces. Arrays are allocated outside threaded kernels and
@@ -25,8 +25,8 @@ must cover the complete MPI process tree.
    UCT-HLL edge line integrals for every local active block. Do not update the
    destination state or invoke geometric/physical source updates in this pass.
 2. Call `usr_ct_stage(qt,qdt,sCT,s,fluxes)` once per rank, outside OpenMP loops.
-   Different ranks may own different numbers of blocks. This is the location for
-   a future world-communicator Yin–Yang exchange, not inside a block hook.
+   Different ranks may own different numbers of blocks. Yin–Yang edge exchange
+   follows this callback on the world communicator.
 3. Apply the discrete curl to face fields, then the original finite-volume update,
    geometric source, face-to-center synchronization, small-value handling and
    physical sources in their original order. Store final edge integrals for the
@@ -149,9 +149,8 @@ condition or characteristic wind outflow is imposed. See
 `tests/yinyang/ct_boundary_sync/README.md` for supported energy modes and tests.
 
 The later experimental integration section describes stage/getbc registration
-and static MHD evolution. Other physical boundary models and actual Yin–Yang CT
-restart verification remain pending. These component interfaces do not enable
-the experimental mode automatically.
+and static MHD evolution. See the adaptive integration section below for
+paired restart and the radial-boundary scope.
 
 When wiring the production path, retain the existing EoS/cache refresh lifecycle
 after B/energy completion. The probe tests use classical total-energy GLM MHD;
@@ -174,11 +173,11 @@ The explicit opt-in configuration is:
 /
 ```
 
-The mesh must satisfy the existing fixed 3D/global-step restrictions, the energy
-model must be classical unsplit total energy, and every radial boundary variable
-must use `cont`. The ordinary GLM path and native spherical CT remain unchanged
-when the opt-in is false. Existing restrictions on additional Yin–Yang physics
-remain in force. This is not a general solar-corona CT release.
+The mesh must satisfy the 3D/global-step restrictions. Classical total and
+internal energy are supported. The outer radial boundary uses `cont`. The
+inner radial boundary accepts either `cont` or the paired fluid and edge
+callbacks described in [the Yin–Yang usage guide](yinyang_v1.md#supported-scope).
+The restriction on additional MHD physics applies across all mesh levels.
 
 `advect1` invokes `yy_runtime_ct_edges` after the user stage callback and before
 any face curl update. The adapter caches geometric-owner angular interface edges,
@@ -186,6 +185,12 @@ including radial endpoints, and applies the tested same-patch/overset sequence.
 `getbc` supplies radial cell donors before angular primitive exchange, then calls
 `yy_runtime_ct_ghosts` to fill faces and synchronize cell variables. It bypasses
 the old radial physical-boundary callback only in this explicitly selected mode.
+On a fixed single-level mesh, the edge plan checks whether every sampled edge
+is read from its geometric owner. If so, the runtime exchanges overset edges
+directly and distributes the updated owner values afterwards. The ordinary
+sibling face fill in `getbc` supplies the interior ghosts before overset face
+interpolation. The final extended face synchronization still fills mixed corners.
+Adaptive meshes retain the preliminary edge and face synchronizations.
 The existing post-getbc EoS refresh is retained. There are no active-field resets.
 
 `tests/yinyang/ct_static` exercises the real MHD time integrator with zero and
@@ -203,6 +208,45 @@ substantial diffusion occurs in both seam and interior cases. This establishes
 stable transport, not high-accuracy, full-order, low-beta or restart qualification.
 See the dated transport section in `yinyang_fixed_grid_progress.md`.
 
+
+## Adaptive CT stage and ghosts
+
+Set `refine_max_level>1` to allow native Yin–Yang refinement. The sparse
+plan uses actual patch-local leaf IDs and world ranks. An all-world
+invalidation follows the native regrid and ownership update, so both
+patches rebuild even when only one tree changes. Restart rebuilds the plan
+from both restored trees. Version-2 paired adaptive CT snapshots also
+support a different valid even MPI world size.
+
+1. Balance the proposed leaf layout using the geometry of the receiver's
+   face and edge stencils. This includes angular ghost halos at the
+   radial wall and at native block interfaces.
+2. Synchronize same-level edge copies under the geometric owner. In the
+   opposite patch, build the receiving level's virtual donor-lattice
+   samples. Equal-level requests take native data. Coarse aligned edge
+   requests sum available fine segments where they own the physical
+   edge. Fine-to-coarse face transfer adds four magnetic subface fluxes.
+3. Prolong coarse data with tensor products of one-dimensional nodal
+   and integral weights. The corresponding nodal difference and
+   integrated maps commute on a complete donor-aligned stencil. The
+   wider pair is used on a uniform coarse donor patch. A mixed donor patch
+   uses the same linear/constant pair on every face and edge, so crossing
+   a level transition does not change the transfer within a child cell.
+   A face conversion uses the native area.
+   An edge conversion uses the native length and retains the substage
+   time factor supplied by UCT.
+4. Reconstruct at the rotated receiver and project onto its normal or
+   tangent. All active levels pack their native edge data before any
+   overset receiving edge is written. The physical inner tangential
+   prescription is excluded from receiving edge updates.
+5. Apply the discrete curl with the final stage edge integrals, followed
+   by native flux and edge reflux. Complete angular face halos, close
+   their discrete magnetic divergence, and then fill the radial face
+   halos and synchronize cell-centered fields and energy.
+
+The donor-aligned map is distinct from rotated projection between
+patches. Their composition has a measurable curl commutator. The
+experimental face-moment option keeps its existing default and scope.
 
 ## Consistent native EMF representation (2026-11-19)
 

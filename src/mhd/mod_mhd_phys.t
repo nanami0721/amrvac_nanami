@@ -898,7 +898,7 @@ contains
       case default
         call mpistop('choose average, uct_contact,or uct_hll for type_ct!')
       end select
-      if(total_energy.and..not.B0field.and..not.mhd_semirelativistic) &
+      if((total_energy.or.(yinyang_enabled.and.mhd_internal_e)).and..not.B0field.and..not.mhd_semirelativistic) &
         phys_ct_sync_center => mhd_ct_sync_center
       phys_face_to_center => mhd_face_to_center
       phys_modify_wLR => mhd_modify_wLR
@@ -1499,13 +1499,14 @@ contains
         MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
       yy_radial_boundary_adjust=yy_adjust_global/=0
       if(yy_ct_experimental) then
-        if(type_divb/=divb_ct.or..not.mhd_energy.or..not.total_energy) &
-          call mpistop('Yin-Yang CT requires CT and total energy')
+        if(type_divb/=divb_ct.or..not.mhd_energy.or..not.(total_energy.or.mhd_internal_e)) &
+          call mpistop('Yin-Yang CT requires CT with total or internal energy')
       else
-        if(.not.mhd_glm.or.type_divb/=divb_glm.or..not.mhd_energy.or..not.total_energy) &
-          call mpistop('yinyang MHD requires GLM and total energy')
+        if(.not.mhd_glm.or.type_divb/=divb_glm.or..not.mhd_energy.or. &
+           .not.(total_energy.or.mhd_internal_e)) &
+          call mpistop('Yin-Yang GLM requires total or internal energy')
       end if
-      if(mhd_semirelativistic.or.mhd_internal_e.or.mhd_hydrodynamic_e.or.mhd_uawsom.or. &
+      if(mhd_semirelativistic.or.mhd_hydrodynamic_e.or.mhd_uawsom.or. &
          mhd_radiative_transfer.or.mhd_radiative_cooling.or.mhd_radiation_fld.or. &
          mhd_thermal_conduction.or.mhd_hyperbolic_tc.or.mhd_trac.or. &
          mhd_rotating_frame.or.mhd_viscosity.or.mhd_hall.or.mhd_ambipolar.or. &
@@ -8924,6 +8925,11 @@ contains
     logical,intent(in) :: keep_pressure
     double precision :: oldb(ixO^S,ndir),delta
     integer :: ix^D
+    ! Internal energy is independent of the magnetic field in active and ghost cells.
+    if(mhd_internal_e.and..not.B0field.and..not.mhd_semirelativistic) then
+      call mhd_face_to_center(ixO^L,s)
+      return
+    end if
     if(B0field.or.mhd_semirelativistic.or..not.total_energy) &
       call mpistop('CT energy sync requires unsplit classical total-energy MHD')
     if(keep_pressure) oldb(ixO^S,:)=s%w(ixO^S,mag(:))

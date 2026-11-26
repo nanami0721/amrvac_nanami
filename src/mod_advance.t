@@ -797,6 +797,7 @@ contains
     double precision :: qdt
     double precision :: lb_t0_advect1, lb_t0_block, ct_exchange_seconds,ct_exchange_start
     integer :: iigrid, igrid
+    type(ct_velocity) :: stage_velocity
 
     istep = istep+1
 
@@ -809,12 +810,13 @@ contains
     ! opedit: Just advance the active grids:
     if (lb_diagnose) lb_t0_advect1 = MPI_WTIME()
     if(ct_stage_split) then
-      ! This first API is intentionally bounded to the fixed-grid 3D UCT-HLL
-      ! path. No AMR, local timestep or MUSCL fallback can consume cached fluxes.
-      if(ndim/=3.or..not.stagger_grid.or.refine_max_level/=1.or.lb_automatic.or. &
+      if(ndim/=3.or..not.stagger_grid.or.lb_automatic.or. &
         local_timestep.or.dimsplit.or.t_stepper/=threestep.or.t_integrator/=ssprk3) &
-        call mpistop('split CT requires fixed 3D global SSPRK3 without AMR/load balancing')
-      if(method(1)/=fs_tvdlf.and.method(1)/=fs_hll) call mpistop('split CT supports TVDLF or HLL')
+        call mpistop('split CT requires 3D global SSPRK3 without cost-weighted balancing')
+      if(refine_max_level/=1.and..not.yy_ct_experimental) &
+        call mpistop('split CT AMR requires experimental Yin-Yang CT')
+      if(any(method(1:refine_max_level)/=fs_tvdlf.and.method(1:refine_max_level)/=fs_hll)) &
+        call mpistop('split CT supports TVDLF or HLL at every mesh level')
       if(.not.associated(phys_get_ct_edges).or..not.associated(phys_apply_ct_edges)) &
         call mpistop('split CT requires UCT-HLL edge and curl procedures')
       if(.not.allocated(stage_fluxes)) allocate(stage_fluxes(max_blocks))
@@ -826,7 +828,7 @@ contains
           allocate(stage_fluxes(igrid)%edge(ixG^T,sdim:3))
         end if
       end do
-      !$OMP PARALLEL DO PRIVATE(igrid)
+      !$OMP PARALLEL DO PRIVATE(igrid,stage_velocity)
       do iigrid=1,igridstail_active
         igrid=igrids_active(iigrid);block=>ps(igrid)
         ^D&dxlevel(^D)=rnode(rpdx^D_,igrid);
@@ -834,7 +836,7 @@ contains
         stage_fluxes(igrid)%edge=0.d0
         call finite_volume(method(block%level),qdt,dtfactor,ixG^LL,ixM^LL,idim^LIM, &
           qtC,psa(igrid),qt,psb(igrid),stage_fluxes(igrid)%face,stage_fluxes(igrid)%edge, &
-          rnode(rpdx1_:rnodehi,igrid),ps(igrid)%x,ct_stage_prepare)
+          rnode(rpdx1_:rnodehi,igrid),ps(igrid)%x,ct_stage_prepare,stage_velocity)
       end do
       !$OMP END PARALLEL DO
       ! Every rank arrives once per RK stage, regardless of its block count.

@@ -370,6 +370,7 @@ without changing time, set `reset_it=T`.
     small_values_fix_iw= LOGICAL, LOGICAL, LOGICAL, ...
     ghostcell_comm_batched= F | T
     ghostcell_comm_batch_size= INTEGER
+    ghostcell_sibling_recv_buffer= F | T
 
     typegrad = 'central' | 'limited'
     typediv = 'central' | 'limited'
@@ -385,6 +386,13 @@ large-scale MHD tests, the original
 all-at-once ghost-cell exchange could stall during spherical u512
 initialization, while u256 5-step tests showed less than 0.1% total runtime
 difference with batching enabled. The default batch size is 64.
+
+With `ghostcell_sibling_recv_buffer=T`, a rank receives cell-centered ghost
+values from remote same-level neighbors into reusable contiguous buffers and
+copies them into the requested variable range after the exchange. This uses
+additional rank-local storage. The default (`F`) receives directly into the
+grid using MPI subarray types. Performance depends on the MPI implementation
+and rank layout. Compare full timestep timings on the target system.
 
 ### time_stepper, time_integrator, flux_scheme {#par_time_integrator}
 

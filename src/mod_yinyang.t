@@ -1,11 +1,18 @@
-!> Fixed-grid overset coupling; local spherical metrics are unchanged.
+!> Yin–Yang overset coupling on native spherical meshes.
 module mod_yinyang
-  use mod_yinyang_staggered, only: yy_staggered_table, yy_staggered_build
+  use mod_yinyang_staggered, only: yy_staggered_table, yy_staggered_build, yy_face_location, yy_edge_location, &
+    yy_staggered_offset, yy_staggered_coordinates, yy_staggered_bracket
   use mod_yinyang_ct_coupling, only: yy_ct_edge_plan, yy_ct_edge_build, yy_ct_edge_exchange, &
     yy_ct_face_plan, yy_ct_face_build, yy_ct_face_exchange, yy_ct_close_ghosts
   use mod_yinyang_patch_sync, only: yy_patch_copy_plan, yy_patch_copy_build, yy_patch_copy_exchange, &
     yy_sync_edges, yy_sync_faces, yy_sync_extended_faces
   use mod_global_parameters
+  use, intrinsic :: iso_fortran_env, only: int64
+  {^IFTHREED
+  use mod_yinyang_glm_amr, only: radial_edge, leaf_directory, build_directory, find_leaf, covering_leaf, &
+    domain_cells, key_level, key_index, key_rank, key_grid, check_level_pair
+  }
+  use mod_yinyang_glm_amr, only: yy_glm_invalidate,yy_glm_report,yy_basis=>yy_glm_basis
   use mod_physics, only: phys_to_primitive, phys_to_conserved, physics_type, &
     phys_ct_sync_center,phys_get_ct_edges,phys_apply_ct_edges
   use mod_comm_lib, only: mpistop
@@ -15,11 +22,13 @@ module mod_yinyang
   ! Owned here: only input parsing and Yin-Yang initialization use this option.
   logical,public :: yy_ct_face_moments=.false.
   public :: yy_validate, yy_exchange, yy_basis, yy_position, yy_checkpoint, yy_checkpoint_begin, yy_report
+  public :: yy_invalidate_after_regrid, yy_refresh_glm_mode
+  logical,save :: glm_mode_known=.false., glm_mode_mixed=.false.
   public :: yy_build_staggered_table, yy_prepare_ct_edges, yy_exchange_ct_edges, yy_ct_stage_plan
-  public :: yy_ct_ghost_plan, yy_prepare_ct_ghosts, yy_fill_ct_ghosts
+  public :: yy_ct_ghost_plan, yy_prepare_ct_ghosts, yy_fill_ct_ghosts, yy_prepare_ct_faces, yy_exchange_ct_faces
   type yy_ct_ghost_plan
     type(yy_ct_face_plan) :: faces
-    integer,allocatable :: receivers(:,:)
+    integer,allocatable :: receivers(:,:),donor_level_range(:,:)
     double precision,allocatable :: radial(:),tangent(:),values(:)
     integer(kind=8) :: mesh_epoch=-1_8
   end type
@@ -32,14 +41,26 @@ module mod_yinyang
   end type
   type yy_ct_stage_plan
     type(yy_ct_edge_plan) :: edge
-    integer,allocatable :: receivers(:,:)
+    integer,allocatable :: receivers(:,:),donor_level_range(:,:)
     double precision,allocatable :: packed(:), received(:)
     integer(kind=8) :: mesh_epoch=-1_8
   end type
+  logical,save :: special_inner_ct=.false.
   public :: yy_runtime_ct_edges, yy_runtime_ct_ghosts, yy_ct_radial_cells
-  type(yy_ct_patch_plan),save :: runtime_patch
-  type(yy_ct_stage_plan),save :: runtime_edges
-  type(yy_ct_ghost_plan),save :: runtime_ghosts
+  type yy_runtime_ct_plan
+    type(yy_ct_patch_plan) :: patch
+    type(yy_ct_stage_plan) :: edges
+    type(yy_ct_ghost_plan) :: ghosts
+  end type
+  type(yy_runtime_ct_plan),allocatable,save :: runtime_ct(:)
+  logical,save :: sync_edges_before_exchange=.true.
+  integer(kind=8),save :: runtime_ct_epoch=-1_8
+  {^IFTHREED
+  public :: yy_ct_balance, yy_ct_virtual_face_sources
+  type(leaf_directory),save :: ct_directory
+  integer(kind=8),save :: ct_directory_epoch=-1_8
+  integer,save :: ct_build_level,ct_uniform_level(0:1)
+  }
   integer(kind=8) :: epoch=-1_8
   integer :: nr=0, ns=0, nt=0, raw_nr=0
   integer(kind=8) :: exchange_calls=0_8
@@ -66,57 +87,532 @@ contains
     call yy_staggered_build(table,MPI_COMM_WORLD,yy_patch,family,bn,nn,radial,angular,directory,points)
   end subroutine
 
-  subroutine yy_staggered_mesh(s,bn,nn,rmax,angular,directory)
+  subroutine yy_staggered_mesh(s,bn,nn,rmax,angular,directory,level)
     type(state),intent(in) :: s(max_blocks)
     integer,intent(out) :: bn(3),nn(3)
     double precision,allocatable,intent(out) :: rmax(:)
     double precision,intent(out) :: angular(2,2)
     integer,allocatable,intent(out) :: directory(:,:)
+    integer,optional,intent(in) :: level
     {^IFTHREED
-    integer :: n,g,p,i,gi
+    integer :: n,g,p,i,gi,l,entries,nb(3)
     integer,allocatable :: local(:,:),counts(:),displs(:)
     double precision,allocatable :: lower(:),upper(:),rmin(:)
     double precision :: radius
-    if(.not.yinyang_enabled.or.refine_max_level/=1.or.lb_automatic) &
-      call mpistop('staggered table requires fixed level-one Yin-Yang layout')
+    if(.not.yinyang_enabled.or.lb_automatic) call mpistop('invalid staggered Yin-Yang layout')
+    l=1
+    if(present(level)) then
+      l=level
+    else if(refine_max_level/=1) then
+      call mpistop('explicit level required for adaptive staggered Yin-Yang layout')
+    end if
     if(stretched_dim(2).or.stretched_dim(3)) call mpistop('staggered table needs uniform angular mesh')
-    nn=[domain_nx1,domain_nx2,domain_nx3];bn=[block_nx1,block_nx2,block_nx3]
+    bn=[block_nx1,block_nx2,block_nx3]
+    nb=[ng1(l),ng2(l),ng3(l)]
+    nn=nb*bn
     allocate(local(6,igridstail),counts(yy_world_size),displs(yy_world_size))
-    allocate(lower(0:nn(1)),upper(0:nn(1)),rmin(0:nn(1)),rmax(0:nn(1)))
-    lower=huge(1.d0);upper=-huge(1.d0)
+    allocate(rmax(0:nn(1)))
+    if(refine_max_level==1) then
+      allocate(lower(0:nn(1)),upper(0:nn(1)),rmin(0:nn(1)))
+    end if
+    if(allocated(lower)) then
+      lower=huge(1.d0);upper=-huge(1.d0)
+    end if
+    entries=0
     do n=1,igridstail
       g=igrids(n)
-      local(:,n)=[node(pig1_,g)-1,node(pig2_,g)-1,node(pig3_,g)-1,g,yy_world_rank,yy_patch]
+      if(node(plevel_,g)/=l) cycle
+      entries=entries+1
+      local(:,entries)=[node(pig1_,g)-1,node(pig2_,g)-1,node(pig3_,g)-1,g,yy_world_rank,yy_patch]
+      if(.not.allocated(lower)) cycle
       do i=ixMlo1-1,ixMhi1
         gi=(node(pig1_,g)-1)*block_nx1+i-ixMlo1+1
         radius=s(g)%x(i,ixMlo2,ixMlo3,1)+0.5d0*s(g)%dx(i,ixMlo2,ixMlo3,1)
         lower(gi)=min(lower(gi),radius);upper(gi)=max(upper(gi),radius)
       end do
     end do
-    call MPI_ALLREDUCE(lower,rmin,nn(1)+1,MPI_DOUBLE_PRECISION,MPI_MIN,MPI_COMM_WORLD,ierrmpi)
-    call MPI_ALLREDUCE(upper,rmax,nn(1)+1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
-    if(any(abs(rmax-rmin)>1.d-12*max(1.d0,abs(rmax)))) &
-      call mpistop('staggered table radial meshes disagree or are incomplete')
-    call MPI_ALLGATHER(6*igridstail,1,MPI_INTEGER,counts,1,MPI_INTEGER,MPI_COMM_WORLD,ierrmpi)
+    if(allocated(lower)) then
+      call MPI_ALLREDUCE(lower,rmin,nn(1)+1,MPI_DOUBLE_PRECISION,MPI_MIN,MPI_COMM_WORLD,ierrmpi)
+      call MPI_ALLREDUCE(upper,rmax,nn(1)+1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+      if(any(abs(rmax-rmin)>1.d-12*max(1.d0,abs(rmax)))) &
+        call mpistop('staggered table radial meshes disagree or are incomplete')
+    else
+      do i=0,nn(1)
+        rmax(i)=radial_edge(l,int(i,int64))
+      end do
+    end if
+    call MPI_ALLGATHER(6*entries,1,MPI_INTEGER,counts,1,MPI_INTEGER,MPI_COMM_WORLD,ierrmpi)
     displs(1)=0
     do p=2,yy_world_size
       displs(p)=displs(p-1)+counts(p-1)
     end do
     allocate(directory(6,sum(counts)/6))
-    call MPI_ALLGATHERV(local,6*igridstail,MPI_INTEGER,directory,counts,displs,MPI_INTEGER,MPI_COMM_WORLD,ierrmpi)
+    call MPI_ALLGATHERV(local,6*entries,MPI_INTEGER,directory,counts,displs,MPI_INTEGER,MPI_COMM_WORLD,ierrmpi)
     angular(:,1)=[xprobmin2,xprobmin3];angular(:,2)=[xprobmax2,xprobmax3]
     }
     {^IFONED call mpistop('staggered Yin-Yang table requires 3D') }
     {^IFTWOD call mpistop('staggered Yin-Yang table requires 3D') }
   end subroutine
 
+  {^IFTHREED
+  ! Check proposed leaves before committing a regrid. The projection and the
+  ! staggered lattice brackets are shared with the exchange plan construction.
+  subroutine yy_ct_balance(dir,want)
+    type(leaf_directory),intent(in) :: dir
+    integer,intent(inout) :: want(:)
+    integer :: n,l,nn(3),bn(3),origin(3),i,j,k,c,boxlo(3),boxhi(3),idx(3),lo(3)
+    integer :: previous_level
+    double precision,allocatable :: radial(:)
+    double precision :: angular(2,2),step(2)
+    logical :: sides(2,2)
+    logical :: mask(-nghostcells-1:block_nx1+nghostcells-1, &
+                    -nghostcells-1:block_nx2+nghostcells-1, &
+                    -nghostcells-1:block_nx3+nghostcells-1,3)
+    bn=[block_nx1,block_nx2,block_nx3]
+    angular(:,1)=[xprobmin2,xprobmin3]
+    angular(:,2)=[xprobmax2,xprobmax3]
+    previous_level=0
+    do n=1,size(dir%leaf,2)
+      if(dir%leaf(key_rank,n)/=yy_world_rank) cycle
+      l=dir%leaf(key_level,n)
+      nn=int(domain_cells(l))
+      origin=(dir%leaf(key_index:key_index+2,n)-1)*bn
+      call ct_face_bounds(l,origin,bn,boxlo,boxhi,sides)
+      if(.not.any(sides)) cycle
+      if(previous_level/=l) then
+        if(allocated(radial)) deallocate(radial)
+        allocate(radial(0:nn(1)))
+        do i=0,nn(1)
+          radial(i)=radial_edge(l,int(i,int64))
+        end do
+        step=(angular(:,2)-angular(:,1))/nn(2:3)
+        previous_level=l
+      end if
+      call ct_face_footprint(boxlo,boxhi,sides,mask)
+      do c=1,3
+        do k=-nghostcells-1,bn(3)+nghostcells-1
+          do j=-nghostcells-1,bn(2)+nghostcells-1
+            do i=-nghostcells-1,bn(1)+nghostcells-1
+              if(mask(i,j,k,c)) call check_target(yy_face_location,c,origin+[i,j,k])
+            end do
+          end do
+        end do
+        lo=-1
+        lo(c)=0
+        do k=lo(3),bn(3)-1
+          do j=lo(2),bn(2)-1
+            do i=lo(1),bn(1)-1
+              idx=origin+[i,j,k]
+              if(.not.ct_seam_edge(idx,c,nn)) cycle
+              if(special_inner_ct.and.c/=1.and.idx(1)==-1) cycle
+              call check_target(yy_edge_location,c,idx)
+            end do
+          end do
+        end do
+      end do
+    end do
+  contains
+    subroutine check_target(family,c,receiver)
+      integer,intent(in) :: family,c,receiver(3)
+      integer :: component,ncomponents,base(3),idx(3),lower(3),upper(3),a,b,h
+      double precision :: offset(3),point(3),sph(3),xyz(3),fraction(3)
+      logical :: valid,moments,edge,shared(3)
+      edge=family==yy_edge_location
+      moments=.not.edge.and.yy_ct_face_moments
+      ncomponents=3
+      if(.not.edge.and.c==1.and..not.moments) ncomponents=1
+      call yy_staggered_offset(family,c,offset)
+      point(1)=radial(receiver(1)+1)
+      if(offset(1)==0.5d0) point(1)=0.5d0*(point(1)+radial(receiver(1)))
+      point(2:3)=angular(:,1)+(receiver(2:3)+offset(2:3))*step
+      call yy_staggered_coordinates(point,yy_patch,sph,xyz)
+      do component=1,ncomponents
+        call yy_staggered_offset(family,component,offset)
+        call yy_staggered_bracket(sph,offset,nn,radial,angular,step,edge.and.component==1,moments,base,fraction,valid)
+        if(.not.valid) call mpistop('projected CT target lacks angular or radial support')
+        shared=edge
+        shared(component)=.not.edge
+        do h=0,1
+          do b=0,1
+            do a=0,1
+              idx=base+[a,b,h]
+              lower=max(0,idx)
+              upper=lower
+              ! An edge/face on a block plane also has a native copy in
+              ! the adjacent block. Fine collinear segments can own EMF.
+              where(shared.and.modulo(idx+1,bn)==0.and.idx>=0) upper=upper+1
+              if(edge) then
+                ! A virtual coarse edge may sum fine segments whose owner
+                ! is on the opposite side of a fine block plane.
+                where(shared.and.modulo(2*(idx+1),bn)==0.and.idx>=0) upper=lower+1
+              end if
+              upper=min(upper,nn-1)
+              call check_sites(lower,upper)
+            end do
+          end do
+        end do
+      end do
+    end subroutine
+
+    subroutine check_sites(lower,upper)
+      integer,intent(in) :: lower(3),upper(3)
+      integer :: i,j,k,other
+      do k=lower(3),upper(3)
+        do j=lower(2),upper(2)
+          do i=lower(1),upper(1)
+            other=covering_leaf(dir,l,int([i,j,k],int64),1-yy_patch)
+            call check_level_pair(dir,n,other,want)
+          end do
+        end do
+      end do
+    end subroutine
+  end subroutine
+
+  pure logical function ct_seam_edge(idx,c,nn) result(seam)
+    integer,intent(in) :: idx(3),c,nn(3)
+    seam=(c/=2.and.(idx(2)==-1.or.idx(2)==nn(2)-1)).or. &
+         (c/=3.and.(idx(3)==-1.or.idx(3)==nn(3)-1))
+  end function
+
+  ! Active radial cells plus all native halo cells inside the physical shell.
+  ! At mixed junctions the whole angular-outside footprint needs an overset
+  ! donor, including halos alongside a coarse/fine radial or angular neighbor.
+  subroutine ct_face_bounds(level,origin,bn,lo,hi,sides)
+    integer,intent(in) :: level,origin(3),bn(3)
+    integer,intent(out) :: lo(3),hi(3)
+    logical,intent(out) :: sides(2,2)
+    integer :: nn(3)
+    nn=int(domain_cells(level))
+    lo=max(-nghostcells,-origin)
+    hi=min(bn+nghostcells-1,nn-1-origin)
+    sides(1,:)=origin(2:3)==0
+    sides(2,:)=origin(2:3)+bn(2:3)==nn(2:3)
+  end subroutine
+
+  subroutine ct_face_footprint(lo,hi,sides,mask)
+    integer,intent(in) :: lo(3),hi(3)
+    logical,intent(in) :: sides(2,2)
+    logical,intent(out) :: mask(-nghostcells-1:,-nghostcells-1:,-nghostcells-1:,:)
+    integer :: i,j,k,c,side,low(3),high(3),idx(3),fl(3)
+    mask=.false.
+    if(.not.any(sides)) return
+    low=lo
+    high=hi
+    where(sides(1,:)) low(2:3)=lo(2:3)-nghostcells
+    where(sides(2,:)) high(2:3)=hi(2:3)+nghostcells
+    do k=low(3),high(3)
+      do j=low(2),high(2)
+        if(j>=lo(2).and.j<=hi(2).and.k>=lo(3).and.k<=hi(3)) cycle
+        do i=lo(1),hi(1)
+          do c=1,3
+            fl=lo
+            fl(c)=fl(c)-1
+            do side=0,1
+              idx=[i,j,k]
+              idx(c)=idx(c)-side
+              if(all(idx>=fl).and.all(idx<=hi)) cycle
+              mask(idx(1),idx(2),idx(3),c)=.true.
+            end do
+          end do
+        end do
+      end do
+    end do
+  end subroutine
+
+  ! Planner callbacks run collectively outside block loops. The cached sparse
+  ! directory lists only leaves; virtual staging never allocates a finest mesh.
+  subroutine yy_ct_prepare_directory(level)
+    integer,optional,intent(in) :: level
+    integer :: n,patch,leaf_level,lo(0:1),hi(0:1)
+    if(.not.present(level)) call mpistop('adaptive CT plan requires a receiver level')
+    if(ct_directory_epoch/=particle_mesh_epoch) then
+      call build_directory(ct_directory)
+      lo=huge(1)
+      hi=0
+      do n=1,size(ct_directory%leaf,2)
+        patch=ct_directory%leaf(key_rank,n)/(yy_world_size/2)
+        leaf_level=ct_directory%leaf(key_level,n)
+        lo(patch)=min(lo(patch),leaf_level)
+        hi(patch)=max(hi(patch),leaf_level)
+      end do
+      ct_uniform_level=merge(lo,0,lo==hi)
+      ct_directory_epoch=particle_mesh_epoch
+    end if
+    ct_build_level=level
+  end subroutine
+
+  subroutine yy_ct_patch_owner(coords,idx,c,edge,rank,grid)
+    integer,intent(inout) :: coords(3)
+    integer,intent(in) :: idx(3),c
+    logical,intent(in) :: edge
+    integer,intent(out) :: rank,grid
+    integer :: leaf,bn(3)
+    if(edge) then
+      bn=[block_nx1,block_nx2,block_nx3]
+      call ct_same_level_entity(ct_build_level,yy_patch,bn,idx,c,.true.,coords,leaf)
+    else
+      leaf=find_leaf(ct_directory,ct_build_level,coords+1,yy_patch)
+    end if
+    rank=-1
+    grid=-1
+    if(leaf==0) return
+    rank=ct_directory%leaf(key_rank,leaf)
+    grid=ct_directory%leaf(key_grid,leaf)
+  end subroutine
+
+  ! A native edge can have up to four same-level copies. Pick the lower
+  ! geometric owner among the actual leaves even at a mixed-level junction.
+  subroutine ct_same_level_entity(level,patch,bn,idx,c,edge,coords,leaf)
+    integer,intent(in) :: level,patch,bn(3),idx(3),c
+    logical,intent(in) :: edge
+    integer,intent(out) :: coords(3),leaf
+    integer :: upper(3),lower(3),i,j,k
+    logical :: shared_axis(3)
+    lower=max(0,idx/bn)
+    upper=lower
+    shared_axis=edge
+    shared_axis(c)=.not.edge
+    where(shared_axis.and.modulo(idx+1,bn)==0.and.idx>=0) upper=upper+1
+    upper=min(upper,[ng1(level),ng2(level),ng3(level)]-1)
+    leaf=0
+    do k=lower(3),upper(3)
+      do j=lower(2),upper(2)
+        do i=lower(1),upper(1)
+          coords=[i,j,k]
+          leaf=find_leaf(ct_directory,level,coords+1,patch)
+          if(leaf/=0) return
+        end do
+      end do
+    end do
+    coords=lower
+  end subroutine
+
+  subroutine yy_ct_donor_sources(family,c,idx,ranks,requests,weights,levels,n)
+    integer,intent(in) :: family,c,idx(3)
+    integer,intent(out) :: ranks(:),requests(:,:),levels(:),n
+    double precision,intent(out) :: weights(:)
+    call ct_donor_sources(ct_build_level,1-yy_patch,family,c,idx,ranks,requests,weights,levels,n)
+  end subroutine
+
+  ! Inspect a coarse parent’s donor-aligned prolongation, including shared faces.
+  ! The production plan must have prepared the current sparse leaf directory.
+  subroutine yy_ct_virtual_face_sources(level,patch,c,idx,ranks,requests,weights,n)
+    integer,intent(in) :: level,patch,c,idx(3)
+    integer,intent(out) :: ranks(:),requests(:,:),n
+    double precision,intent(out) :: weights(:)
+    integer :: levels(size(ranks))
+    if(ct_directory_epoch/=particle_mesh_epoch) call mpistop('adaptive CT leaf directory is stale')
+    if(level<2.or.patch<0.or.patch>1.or.c<1.or.c>3) call mpistop('invalid virtual CT child face')
+    call ct_donor_sources(level,patch,yy_face_location,c,idx,ranks,requests,weights,levels,n,source_level=level-1)
+  end subroutine
+
+  subroutine ct_donor_sources(l,patch,family,c,idx,ranks,requests,weights,levels,n,source_level)
+    integer,intent(in) :: l,patch,family,c,idx(3)
+    integer,intent(out) :: ranks(:),requests(:,:),levels(:),n
+    double precision,intent(out) :: weights(:)
+    integer,optional,intent(in) :: source_level
+    integer :: ld,leaf,d,term(4,3),count(3),site(3)
+    integer :: bn(3),dims(3)
+    double precision :: coef(4,3),measure,weight
+    logical :: integrated(3),ok,wider
+    bn=[block_nx1,block_nx2,block_nx3]
+    if(present(source_level)) then
+      ld=source_level
+    else
+      leaf=covering_leaf(ct_directory,l,int(max(idx,0),int64),patch)
+      ld=ct_directory%leaf(key_level,leaf)
+    end if
+    n=0
+    if(abs(ld-l)>1) return
+    if(ld==l) then
+      weight=1.d0
+      if(family==yy_edge_location) weight=1.d0/ct_measure(l,family,c,idx)
+      call append(ld,idx,weight,ok)
+      return
+    end if
+    integrated=(family==yy_face_location)
+    integrated(c)=.not.integrated(c)
+    measure=ct_measure(l,family,c,idx)
+    if(ld>l) then
+      ! Restrict actual fine subface fluxes or fine segment line integrals.
+      do d=1,3
+        if(integrated(d)) then
+          count(d)=2
+          term(1:2,d)=2*idx(d)+[0,1]
+        else
+          count(d)=1
+          term(1,d)=2*idx(d)+1
+        end if
+        coef(:,d)=1.d0
+      end do
+      call tensor_terms(ld,ok)
+      if(.not.ok) n=0
+    else
+      dims=int(domain_cells(ld))
+      ! The integral and point maps commute with the incidence difference.
+      ! Use one tensor pair throughout the donor patch. A face-dependent
+      ! fallback would break flux closure between faces of the same child.
+      wider=ct_uniform_level(patch)==ld
+      do d=1,3
+        call ct_prolong_axis(idx(d),dims(d),integrated(d),wider,term(:,d),coef(:,d),count(d))
+      end do
+      call tensor_terms(ld,ok)
+      if(.not.ok) n=0
+    end if
+  contains
+    subroutine tensor_terms(level,complete)
+      integer,intent(in) :: level
+      logical,intent(out) :: complete
+      integer :: t1,t2,t3
+      complete=.false.
+      do t3=1,count(3)
+        do t2=1,count(2)
+          do t1=1,count(1)
+            site=[term(t1,1),term(t2,2),term(t3,3)]
+            weight=coef(t1,1)*coef(t2,2)*coef(t3,3)/measure
+            if(family==yy_face_location) weight=weight*ct_measure(level,family,c,site)
+            call append(level,site,weight,complete)
+            if(.not.complete) return
+          end do
+        end do
+      end do
+    end subroutine
+
+    subroutine append(level,point,factor,found)
+      integer,intent(in) :: level,point(3)
+      double precision,intent(in) :: factor
+      logical,intent(out) :: found
+      integer :: g,coords(3),segment,children(3,2),child_coords(3,2),child_leaf(2)
+      coords=max(0,point/bn)
+      if(family==yy_edge_location) then
+        call ct_same_level_entity(level,patch,bn,point,c,.true.,coords,g)
+        if(level<ct_directory%deepest) then
+          ! Native edge reflux uses fine collinear segments where they exist.
+          ! Use the same authority for coarse donors before cross-patch reads.
+          do segment=1,2
+            children(:,segment)=2*point+1
+            children(c,segment)=2*point(c)+segment-1
+            call ct_same_level_entity(level+1,patch,bn,children(:,segment),c,.true., &
+              child_coords(:,segment),child_leaf(segment))
+          end do
+          if(all(child_leaf/=0)) then
+            found=.true.
+            do segment=1,2
+              call record(level+1,children(:,segment),child_coords(:,segment),child_leaf(segment),factor)
+            end do
+            return
+          end if
+        end if
+      else
+        call ct_same_level_entity(level,patch,bn,point,c,.false.,coords,g)
+      end if
+      found=g/=0
+      if(found) call record(level,point,coords,g,factor)
+    end subroutine
+
+    subroutine record(level,point,coords,g,factor)
+      integer,intent(in) :: level,point(3),coords(3),g
+      double precision,intent(in) :: factor
+      if(abs(level-l)>1) call mpistop('adaptive CT actual donor exceeds the one-level stencil bound')
+      n=n+1
+      if(n>size(ranks)) call mpistop('adaptive CT donor stencil exceeds storage capacity')
+      ranks(n)=ct_directory%leaf(key_rank,g)+1
+      requests(:,n)=[ct_directory%leaf(key_grid,g),point-coords*bn,c]
+      levels(n)=level
+      weights(n)=factor
+    end subroutine
+  end subroutine
+
+  pure subroutine ct_prolong_axis(index,ncoarse,integrated,wider,sites,coeff,count)
+    integer,intent(in) :: index,ncoarse
+    logical,intent(in) :: integrated,wider
+    integer,intent(out) :: sites(4),count
+    double precision,intent(out) :: coeff(4)
+    integer :: parent,vertex,odd
+    if(integrated) then
+      parent=index/2
+      count=1
+      sites(1)=parent
+      coeff(1)=0.5d0
+      if(.not.wider) return
+      odd=modulo(index,2)
+      if(parent==0) then
+        count=2
+        sites(1:2)=[parent,parent+1]
+        coeff(1:2)=[0.5d0+(1-2*odd)*0.125d0,-(1-2*odd)*0.125d0]
+      else if(parent==ncoarse-1) then
+        count=2
+        sites(1:2)=[parent,parent-1]
+        coeff(1:2)=[0.5d0-(1-2*odd)*0.125d0,(1-2*odd)*0.125d0]
+      else
+        count=3
+        sites(2:3)=[parent-1,parent+1]
+        coeff(2:3)=[(1-2*odd)*0.0625d0,-(1-2*odd)*0.0625d0]
+      end if
+    else
+      vertex=index+1
+      parent=vertex/2-1
+      count=1
+      sites(1)=parent
+      coeff(1)=1.d0
+      if(modulo(vertex,2)==0) return
+      count=2
+      sites(2)=parent+1
+      coeff(1:2)=0.5d0
+      if(.not.wider) return
+      if(parent==-1) then
+        count=3
+        sites(3)=1
+        coeff(1:3)=[0.375d0,0.75d0,-0.125d0]
+      else if(parent==ncoarse-2) then
+        count=3
+        sites(3)=parent-1
+        coeff(1:3)=[0.75d0,0.375d0,-0.125d0]
+      else
+        count=4
+        sites(3:4)=[parent-1,parent+2]
+        coeff(1:4)=[0.5625d0,0.5625d0,-0.0625d0,-0.0625d0]
+      end if
+    end if
+  end subroutine
+
+  ! Native spherical metric for the positive face normal or edge tangent.
+  pure double precision function ct_measure(level,family,c,idx) result(value)
+    integer,intent(in) :: level,family,c,idx(3)
+    double precision :: r0,r1,t1,dteta,dphi
+    r1=radial_edge(level,int(idx(1),int64)+1_int64)
+    dteta=dx(2,level)
+    dphi=dx(3,level)
+    t1=xprobmin2+(idx(2)+1)*dteta
+    if(family==yy_edge_location) then
+      select case(c)
+      case(1);value=r1-radial_edge(level,int(idx(1),int64))
+      case(2);value=r1*dteta
+      case(3);value=r1*sin(t1)*dphi
+      end select
+    else
+      select case(c)
+      case(1)
+        value=2.d0*r1*r1*sin(t1-0.5d0*dteta)*sin(0.5d0*dteta)*dphi
+      case(2)
+        r0=radial_edge(level,int(idx(1),int64))
+        value=0.5d0*(r1-r0)*(r1+r0)*sin(t1)*dphi
+      case(3)
+        r0=radial_edge(level,int(idx(1),int64))
+        value=0.5d0*(r1-r0)*(r1+r0)*dteta
+      end select
+    end if
+  end function
+  }
+
   ! Receiver rows are local block ID, native i,j,k and direction. Select only
   ! desired interface edges; uncomputed UCT workspace may never be a donor.
-  subroutine yy_prepare_ct_edges(plan,s,receivers,radial_extrapolate,native_midpoint)
+  subroutine yy_prepare_ct_edges(plan,s,receivers,radial_extrapolate,native_midpoint,level)
     type(yy_ct_stage_plan),intent(out) :: plan
     type(state),intent(in) :: s(max_blocks)
     integer,intent(in) :: receivers(:,:)
     logical,optional,intent(in) :: radial_extrapolate,native_midpoint
+    integer,optional,intent(in) :: level
     {^IFTHREED
     logical :: midpoint
     integer :: nn(3),bn(3),n,g,c,idx(3),lo(3),hi(3)
@@ -124,7 +620,7 @@ contains
     double precision,allocatable :: radial(:),centers(:,:),widths(:)
     double precision :: angular(2,2),offset(3)
     if(size(receivers,1)/=5) call mpistop('CT edge receiver shape must be (5,n)')
-    call yy_staggered_mesh(s,bn,nn,radial,angular,directory)
+    call yy_staggered_mesh(s,bn,nn,radial,angular,directory,level)
     allocate(centers(3,size(receivers,2)),widths(size(receivers,2)))
     do n=1,size(receivers,2)
       g=receivers(1,n);c=receivers(5,n);idx=receivers(2:4,n)
@@ -137,9 +633,26 @@ contains
       widths(n)=s(g)%dx(idx(1),idx(2),idx(3),c)
     end do
     midpoint=.true.;if(present(native_midpoint))midpoint=native_midpoint
-    call yy_ct_edge_build(plan%edge,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
-      centers,widths,receivers(5,:),radial_extrapolate,native_midpoint=midpoint)
-    if(any(.not.plan%edge%covered)) call mpistop('CT edge lacks full donors: boundary closure required')
+    if(refine_max_level>1) then
+      call yy_ct_prepare_directory(level)
+      call yy_ct_edge_build(plan%edge,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
+        centers,widths,receivers(5,:),radial_extrapolate,native_midpoint=midpoint,sources=yy_ct_donor_sources)
+      if(midpoint) then
+        plan%donor_level_range=plan%edge%samples%donor_level_range
+      else
+        allocate(plan%donor_level_range(2,size(receivers,2)))
+        do n=1,size(receivers,2)
+          plan%donor_level_range(:,n)=[minval(plan%edge%samples%donor_level_range(1,2*n-1:2*n)), &
+            maxval(plan%edge%samples%donor_level_range(2,2*n-1:2*n))]
+        end do
+      end if
+    else
+      call yy_ct_edge_build(plan%edge,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
+        centers,widths,receivers(5,:),radial_extrapolate,native_midpoint=midpoint)
+      allocate(plan%donor_level_range(2,size(receivers,2)))
+      plan%donor_level_range=1
+    end if
+    if(any(.not.plan%edge%covered)) call mpistop('CT edge lacks complete donor stencil')
     do n=1,size(plan%edge%samples%request,2)
       idx=plan%edge%samples%request(2:4,n)+[ixMlo1,ixMlo2,ixMlo3]
       c=plan%edge%samples%request(5,n)
@@ -157,9 +670,10 @@ contains
 
   ! Invoke at the all-block RK-stage boundary, before any edge is overwritten.
   ! All requested donor integrals are packed before the collective returns.
-  subroutine yy_exchange_ct_edges(plan,fluxes)
+  subroutine yy_exchange_ct_edges(plan,fluxes,defer_write)
     type(yy_ct_stage_plan),intent(inout) :: plan
     type(ct_stage_flux),intent(inout) :: fluxes(:)
+    logical,optional,intent(in) :: defer_write
     {^IFTHREED
     integer :: n,g,c,i,j,k
     if(.not.allocated(plan%packed)) call mpistop('CT edge plan has not been built')
@@ -174,6 +688,20 @@ contains
       plan%packed(n)=fluxes(g)%edge(i,j,k,c)
     end do
     call yy_ct_edge_exchange(plan%edge,plan%packed,plan%received)
+    if(present(defer_write)) then
+      if(defer_write) return
+    end if
+    call yy_write_ct_edges(plan,fluxes)
+    }
+    {^IFONED call mpistop('CT edge exchange requires 3D') }
+    {^IFTWOD call mpistop('CT edge exchange requires 3D') }
+  end subroutine
+
+  subroutine yy_write_ct_edges(plan,fluxes)
+    type(yy_ct_stage_plan),intent(in) :: plan
+    type(ct_stage_flux),intent(inout) :: fluxes(:)
+    {^IFTHREED
+    integer :: n,g,c,i,j,k
     do n=1,size(plan%received)
       if(.not.plan%edge%covered(n)) cycle
       g=plan%receivers(1,n);i=plan%receivers(2,n);j=plan%receivers(3,n)
@@ -188,43 +716,110 @@ contains
 
   ! Enumerate the union of faces bounding external angular ghost cells. Active
   ! faces, including active-boundary anchors, are excluded before interpolation.
-  subroutine yy_prepare_ct_ghosts(plan,s,face_moments)
+  ! Build the same projection used for ghost faces on explicit receiver faces.
+  ! Diagnostic callers may select active faces in an independent scratch state.
+  subroutine yy_prepare_ct_faces(plan,s,receivers,level,face_moments)
+    type(yy_ct_ghost_plan),intent(out) :: plan
+    type(state),intent(in) :: s(max_blocks)
+    integer,intent(in) :: receivers(:,:)
+    integer,optional,intent(in) :: level
+    logical,optional,intent(in) :: face_moments
+    {^IFTHREED
+    integer :: bn(3),nn(3),n,g,c,idx(3),above(3)
+    integer,allocatable :: directory(:,:)
+    logical :: moments
+    double precision,allocatable :: radial(:),centers(:,:),widths(:,:)
+    double precision :: angular(2,2),offset(3)
+    if(size(receivers,1)/=5) call mpistop('CT face receiver shape must be (5,n)')
+    call yy_staggered_mesh(s,bn,nn,radial,angular,directory,level)
+    allocate(centers(3,size(receivers,2)),widths(3,size(receivers,2)))
+    allocate(plan%values(size(receivers,2)),plan%donor_level_range(2,size(receivers,2)))
+    plan%receivers=receivers
+    do n=1,size(receivers,2)
+      g=receivers(1,n);idx=receivers(2:4,n);c=receivers(5,n)
+      if(c<1.or.c>3) call mpistop('invalid receiving face direction')
+      if(.not.any(igrids(1:igridstail)==g)) call mpistop('receiving CT block is not local')
+      above=max(idx,[ixGlo1,ixGlo2,ixGlo3])
+      offset=0.d0;offset(c)=0.5d0
+      if(idx(c)<above(c)) offset(c)=-0.5d0
+      widths(:,n)=s(g)%dx(above(1),above(2),above(3),:)
+      centers(:,n)=s(g)%x(above(1),above(2),above(3),:)+offset*widths(:,n)
+    end do
+    moments=.false.
+    if(present(face_moments)) moments=face_moments
+    if(refine_max_level>1) then
+      call yy_ct_prepare_directory(level)
+      if(moments) then
+        call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
+          centers,receivers(5,:),widths,sources=yy_ct_donor_sources)
+      else
+        call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
+          centers,receivers(5,:),sources=yy_ct_donor_sources)
+      end if
+      plan%donor_level_range(:,plan%faces%rslot)=plan%faces%radial%donor_level_range
+      plan%donor_level_range(:,plan%faces%tslot)=plan%faces%tangent%donor_level_range
+    else
+      if(moments) then
+        call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
+          centers,receivers(5,:),widths)
+      else
+        call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory,centers,receivers(5,:))
+      end if
+      plan%donor_level_range=1
+    end if
+    if(any(.not.plan%faces%covered)) call mpistop('CT ghost face lacks complete donor stencil')
+    allocate(plan%radial(size(plan%faces%radial%request,2)),plan%tangent(size(plan%faces%tangent%request,2)))
+    plan%mesh_epoch=particle_mesh_epoch
+    }
+    {^IFONED call mpistop('magnetic face exchange requires 3D') }
+    {^IFTWOD call mpistop('magnetic face exchange requires 3D') }
+  end subroutine
+
+  subroutine yy_prepare_ct_ghosts(plan,s,face_moments,level)
     type(yy_ct_ghost_plan),intent(out) :: plan
     type(state),intent(in) :: s(max_blocks)
     logical,optional,intent(in) :: face_moments
+    integer,optional,intent(in) :: level
     {^IFTHREED
-    integer :: bn(3),nn(3),n,g,i,j,k,c,d,side,pass,t,idx(3),above(3),lo(3),hi(3),fl(3),pig(3),nb(3)
-    integer,allocatable :: directory(:,:)
-    logical :: moments
+    integer :: n,g,i,j,k,c,side,pass,t,idx(3),lo(3),hi(3),fl(3),pig(3),nb(3),l
+    integer :: low(3),high(3),bn(3)
     logical :: sides(2,2),selected,mask(ixGlo1-1:ixGhi1,ixGlo2-1:ixGhi2,ixGlo3-1:ixGhi3,3)
-    double precision,allocatable :: radial(:),centers(:,:),widths(:,:)
-    double precision :: angular(2,2),offset(3)
-    call yy_staggered_mesh(s,bn,nn,radial,angular,directory)
-    lo=[ixMlo1,ixMlo2,ixMlo3];hi=[ixMhi1,ixMhi2,ixMhi3];nb=nn/bn
+    integer,allocatable :: receivers(:,:)
+    l=1
+    if(present(level)) l=level
+    lo=[ixMlo1,ixMlo2,ixMlo3];hi=[ixMhi1,ixMhi2,ixMhi3];nb=[ng1(l),ng2(l),ng3(l)]
+    bn=[block_nx1,block_nx2,block_nx3]
     do pass=1,2
       t=0
       do n=1,igridstail
-        g=igrids(n);pig=[node(pig1_,g),node(pig2_,g),node(pig3_,g)]
-        sides(1,:)=(pig(2:3)==1);sides(2,:)=(pig(2:3)==nb(2:3));mask=.false.
-        do k=ixGlo3,ixGhi3
-          do j=ixGlo2,ixGhi2
-            selected=((j<lo(2).and.sides(1,1)).or.(j>hi(2).and.sides(2,1))) &
-              .and.k>=lo(3).and.k<=hi(3)
-            if((k<lo(3).and.sides(1,2)).or.(k>hi(3).and.sides(2,2))) &
-              selected=(j>=lo(2).and.j<=hi(2)).or.(j<lo(2).and.sides(1,1)).or.(j>hi(2).and.sides(2,1))
-            if(.not.selected) cycle
-            do i=lo(1),hi(1)
-              do c=1,3
-                do side=0,1
-                  idx=[i,j,k];idx(c)=idx(c)-side
-                  fl=lo;fl(c)=fl(c)-1
-                  if(all(idx>=fl).and.all(idx<=hi)) cycle
-                  mask(idx(1),idx(2),idx(3),c)=.true.
+        g=igrids(n)
+        if(node(plevel_,g)/=l) cycle
+        pig=[node(pig1_,g),node(pig2_,g),node(pig3_,g)]
+        if(refine_max_level>1) then
+          call ct_face_bounds(l,(pig-1)*bn,bn,low,high,sides)
+          call ct_face_footprint(low,high,sides,mask)
+        else
+          sides(1,:)=(pig(2:3)==1);sides(2,:)=(pig(2:3)==nb(2:3));mask=.false.
+          do k=ixGlo3,ixGhi3
+            do j=ixGlo2,ixGhi2
+              selected=((j<lo(2).and.sides(1,1)).or.(j>hi(2).and.sides(2,1))) &
+                .and.k>=lo(3).and.k<=hi(3)
+              if((k<lo(3).and.sides(1,2)).or.(k>hi(3).and.sides(2,2))) &
+                selected=(j>=lo(2).and.j<=hi(2)).or.(j<lo(2).and.sides(1,1)).or.(j>hi(2).and.sides(2,1))
+              if(.not.selected) cycle
+              do i=lo(1),hi(1)
+                do c=1,3
+                  do side=0,1
+                    idx=[i,j,k];idx(c)=idx(c)-side
+                    fl=lo;fl(c)=fl(c)-1
+                    if(all(idx>=fl).and.all(idx<=hi)) cycle
+                    mask(idx(1),idx(2),idx(3),c)=.true.
+                  end do
                 end do
               end do
             end do
           end do
-        end do
+        end if
         do c=1,3
           do k=ixGlo3-1,ixGhi3
             do j=ixGlo2-1,ixGhi2
@@ -232,33 +827,15 @@ contains
                 if(.not.mask(i,j,k,c)) cycle
                 t=t+1
                 if(pass==1) cycle
-                plan%receivers(:,t)=[g,i,j,k,c];idx=[i,j,k]
-                above=max(idx,[ixGlo1,ixGlo2,ixGlo3])
-                offset=0.d0;offset(c)=0.5d0
-                ! Lower outer face has no center x at index zero. Locate it
-                ! from the adjacent cell center, not from uninitialized x.
-                if(idx(c)<above(c)) offset(c)=-0.5d0
-                widths(:,t)=s(g)%dx(above(1),above(2),above(3),:)
-                centers(:,t)=s(g)%x(above(1),above(2),above(3),:)+ &
-                  offset*s(g)%dx(above(1),above(2),above(3),:)
+                receivers(:,t)=[g,i,j,k,c]
               end do
             end do
           end do
         end do
       end do
-      if(pass==1) allocate(plan%receivers(5,t),centers(3,t),widths(3,t),plan%values(t))
+      if(pass==1) allocate(receivers(5,t))
     end do
-    moments=.false.;if(present(face_moments))moments=face_moments
-    if(moments)then
-      call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
-        centers,plan%receivers(5,:),widths)
-    else
-      call yy_ct_face_build(plan%faces,MPI_COMM_WORLD,yy_patch,bn,nn,radial,angular,directory, &
-        centers,plan%receivers(5,:))
-    end if
-    if(any(.not.plan%faces%covered)) call mpistop('magnetic ghost face lacks donors: increase overlap')
-    allocate(plan%radial(size(plan%faces%radial%request,2)),plan%tangent(size(plan%faces%tangent%request,2)))
-    plan%mesh_epoch=particle_mesh_epoch
+    call yy_prepare_ct_faces(plan,s,receivers,level,face_moments)
     }
     {^IFONED call mpistop('magnetic ghost fill requires 3D') }
     {^IFTWOD call mpistop('magnetic ghost fill requires 3D') }
@@ -267,20 +844,14 @@ contains
   ! Fill face B in angular halos, optionally followed by outward flux closure.
   ! Both donor families are packed before any writes, so a ghost never becomes
   ! a donor through ordering. Caller handles physical radial and same-patch BCs.
-  subroutine yy_fill_ct_ghosts(plan,s,constrain)
+  subroutine yy_exchange_ct_faces(plan,s)
     type(yy_ct_ghost_plan),intent(inout) :: plan
     type(state),intent(inout) :: s(max_blocks)
-    logical,intent(in) :: constrain
     {^IFTHREED
-    integer :: n,g,i,j,k,c,idx(3),lo(3),hi(3),status,pig(3),nb(3)
-    logical :: sides(2,2)
-    if(.not.allocated(plan%values)) call mpistop('magnetic ghost plan has not been built')
-    if(plan%mesh_epoch/=particle_mesh_epoch) call mpistop('magnetic ghost plan is stale')
-    lo=[ixMlo1,ixMlo2,ixMlo3];hi=[ixMhi1,ixMhi2,ixMhi3];nb=[ng1(1),ng2(1),ng3(1)]
-    do n=1,igridstail
-      g=igrids(n)
-      if(.not.allocated(s(g)%ws)) call mpistop('magnetic face workspace missing')
-    end do
+    integer :: n,g,i,j,k,c,idx(3),lo(3)
+    if(.not.allocated(plan%values)) call mpistop('magnetic face plan has not been built')
+    if(plan%mesh_epoch/=particle_mesh_epoch) call mpistop('magnetic face plan is stale')
+    lo=[ixMlo1,ixMlo2,ixMlo3]
     do n=1,size(plan%radial)
       g=plan%faces%radial%request(1,n);idx=plan%faces%radial%request(2:4,n)+lo
       c=plan%faces%radial%request(5,n)
@@ -297,11 +868,39 @@ contains
       k=plan%receivers(4,n);c=plan%receivers(5,n)
       s(g)%ws(i,j,k,c)=plan%values(n)
     end do
+    }
+    {^IFONED call mpistop('magnetic face exchange requires 3D') }
+    {^IFTWOD call mpistop('magnetic face exchange requires 3D') }
+  end subroutine
+
+  subroutine yy_fill_ct_ghosts(plan,s,constrain,level)
+    type(yy_ct_ghost_plan),intent(inout) :: plan
+    type(state),intent(inout) :: s(max_blocks)
+    logical,intent(in) :: constrain
+    integer,optional,intent(in) :: level
+    {^IFTHREED
+    integer :: n,g,lo(3),hi(3),status,pig(3),nb(3),l,low(3),high(3),bn(3)
+    logical :: sides(2,2)
+    call yy_exchange_ct_faces(plan,s)
+    l=1
+    if(present(level)) l=level
+    lo=[ixMlo1,ixMlo2,ixMlo3];hi=[ixMhi1,ixMhi2,ixMhi3];nb=[ng1(l),ng2(l),ng3(l)]
     if(constrain) then
       do n=1,igridstail
-        g=igrids(n);pig=[node(pig1_,g),node(pig2_,g),node(pig3_,g)]
-        sides(1,:)=(pig(2:3)==1);sides(2,:)=(pig(2:3)==nb(2:3))
-        call yy_ct_close_ghosts([ixGlo1-1,ixGlo2-1,ixGlo3-1],lo,hi, &
+        g=igrids(n)
+        if(node(plevel_,g)/=l) cycle
+        pig=[node(pig1_,g),node(pig2_,g),node(pig3_,g)]
+        low=lo
+        high=hi
+        if(refine_max_level>1) then
+          bn=[block_nx1,block_nx2,block_nx3]
+          call ct_face_bounds(l,(pig-1)*bn,bn,low,high,sides)
+          low=low+lo
+          high=high+lo
+        else
+          sides(1,:)=(pig(2:3)==1);sides(2,:)=(pig(2:3)==nb(2:3))
+        end if
+        call yy_ct_close_ghosts([ixGlo1-1,ixGlo2-1,ixGlo3-1],low,high, &
           [ixGlo1,ixGlo2,ixGlo3],[ixGhi1,ixGhi2,ixGhi3],sides,s(g)%ws,s(g)%surfaceC,status)
         if(status/=0) call mpistop('invalid geometry or field in magnetic ghost closure')
       end do
@@ -311,26 +910,45 @@ contains
     {^IFTWOD call mpistop('magnetic ghost fill requires 3D') }
   end subroutine
 
-  subroutine yy_prepare_ct_patch(plan,s)
+  subroutine yy_prepare_ct_patch(plan,s,level)
     type(yy_ct_patch_plan),intent(out) :: plan
     type(state),intent(in) :: s(max_blocks)
+    integer,optional,intent(in) :: level
     integer :: bn(3),nn(3)
     integer,allocatable :: directory(:,:)
     double precision,allocatable :: radial(:)
     double precision :: angular(2,2)
-    call yy_staggered_mesh(s,bn,nn,radial,angular,directory)
-    call yy_patch_copy_build(plan%edge,MPI_COMM_WORLD,yy_patch,yy_sync_edges,bn,nn,nghostcells,directory)
-    call yy_patch_copy_build(plan%interior_faces,MPI_COMM_WORLD,yy_patch,yy_sync_faces,bn,nn,nghostcells,directory)
-    call yy_patch_copy_build(plan%extended_faces,MPI_COMM_WORLD,yy_patch,yy_sync_extended_faces, &
-      bn,nn,nghostcells,directory)
+    call yy_staggered_mesh(s,bn,nn,radial,angular,directory,level)
+    {^IFTHREED
+    if(refine_max_level>1) then
+      call yy_ct_prepare_directory(level)
+      call yy_patch_copy_build(plan%edge,MPI_COMM_WORLD,yy_patch,yy_sync_edges,bn,nn,nghostcells,directory, &
+        owner_lookup=yy_ct_patch_owner)
+      call yy_patch_copy_build(plan%interior_faces,MPI_COMM_WORLD,yy_patch,yy_sync_faces,bn,nn,nghostcells,directory, &
+        owner_lookup=yy_ct_patch_owner)
+      call yy_patch_copy_build(plan%extended_faces,MPI_COMM_WORLD,yy_patch,yy_sync_extended_faces, &
+        bn,nn,nghostcells,directory,owner_lookup=yy_ct_patch_owner)
+    else
+      call yy_patch_copy_build(plan%edge,MPI_COMM_WORLD,yy_patch,yy_sync_edges,bn,nn,nghostcells,directory)
+      call yy_patch_copy_build(plan%interior_faces,MPI_COMM_WORLD,yy_patch,yy_sync_faces,bn,nn,nghostcells,directory)
+      call yy_patch_copy_build(plan%extended_faces,MPI_COMM_WORLD,yy_patch,yy_sync_extended_faces, &
+        bn,nn,nghostcells,directory)
+    end if
+    }
     plan%mesh_epoch=particle_mesh_epoch
   end subroutine
 
   logical function yy_ct_edge_is_owner(g,idx,c) result(owner)
     integer,intent(in) :: g,idx(3),c
     {^IFTHREED
-    integer :: d,lo(3),pig(3)
+    integer :: d,lo(3),pig(3),bn(3),coords(3),leaf
     lo=[ixMlo1,ixMlo2,ixMlo3];pig=[node(pig1_,g),node(pig2_,g),node(pig3_,g)]
+    if(ct_directory_epoch==particle_mesh_epoch) then
+      bn=[block_nx1,block_nx2,block_nx3]
+      call ct_same_level_entity(node(plevel_,g),yy_patch,bn,(pig-1)*bn+idx-lo,c,.true.,coords,leaf)
+      owner=all(coords==pig-1)
+      return
+    end if
     owner=.true.
     do d=1,3
       if(d==c) cycle
@@ -442,14 +1060,13 @@ contains
     {^IFTHREED
     integer :: n,g,side,anchor,first,last,stride,i,j,k,c,jlo,klo
     double precision :: transverse
-    if(.not.yinyang_enabled.or.refine_max_level/=1.or.lb_automatic) &
-      call mpistop('CT radial fill requires fixed Yin-Yang mesh')
+    if(.not.yinyang_enabled.or.lb_automatic) call mpistop('invalid Yin-Yang CT radial layout')
     do n=1,igridstail
       g=igrids(n)
       if(.not.allocated(s(g)%ws)) call mpistop('CT radial face state missing')
       do side=1,2
         if(side==1.and.node(pig1_,g)/=1) cycle
-        if(side==2.and.node(pig1_,g)/=domain_nx1/block_nx1) cycle
+        if(side==2.and.node(pig1_,g)/=ng1(node(plevel_,g))) cycle
         anchor=ixMlo1;first=ixMlo1-1;last=ixGlo1;stride=-1
         if(side==2) then
           anchor=ixMhi1;first=ixMhi1+1;last=ixGhi1;stride=1
@@ -506,8 +1123,8 @@ contains
       end subroutine
     end interface
     integer :: n,g,d,side,i,anchor,ixO^L,lo(ndim),hi(ndim),amin(ndim),amax(ndim),gmin(ndim),gmax(ndim)
-    if(ndim/=3.or..not.yinyang_enabled.or.refine_max_level/=1.or.lb_automatic) &
-      call mpistop('CT state sync requires fixed 3D Yin-Yang mesh')
+    if(ndim/=3.or..not.yinyang_enabled.or.lb_automatic) &
+      call mpistop('CT state sync requires 3D Yin-Yang coordinates')
     {^D& amin(^D)=ixMlo^D;amax(^D)=ixMhi^D;gmin(^D)=ixGlo^D;gmax(^D)=ixGhi^D;\}
     do n=1,igridstail
       g=igrids(n)
@@ -524,8 +1141,8 @@ contains
           {^IFTHREED
           if(d==1) then
             anchor=0
-            if(side==1.and.node(pig1_,g)==1) anchor=ixMlo1
-            if(side==2.and.node(pig1_,g)==domain_nx1/block_nx1) anchor=ixMhi1
+            if(side==1.and.node(pig1_,g)==1.and..not.special_inner_ct) anchor=ixMlo1
+            if(side==2.and.node(pig1_,g)==ng1(node(plevel_,g))) anchor=ixMhi1
             if(anchor/=0) then
               ! Copy after active and angular ghost B/energy are consistent.
               do i=lo(1),hi(1)
@@ -546,64 +1163,131 @@ contains
     type(state),intent(in) :: s(max_blocks)
     {^IFTHREED
     integer,allocatable :: receivers(:,:)
-    integer :: pass,n,g,c,i,j,k,idx(3),gi(3),bc(3),lo(3),hi(3),bn(3),nn(3),count
-    if(runtime_patch%mesh_epoch==particle_mesh_epoch) return
-    call yy_prepare_ct_patch(runtime_patch,s)
-    call yy_prepare_ct_ghosts(runtime_ghosts,s,face_moments=yy_ct_face_moments)
-    bn=[block_nx1,block_nx2,block_nx3];nn=[domain_nx1,domain_nx2,domain_nx3]
-    hi=[ixMhi1,ixMhi2,ixMhi3]
-    do pass=1,2
-      count=0
-      do n=1,igridstail
-        g=igrids(n);bc=[node(pig1_,g)-1,node(pig2_,g)-1,node(pig3_,g)-1]
-        do c=1,3
-          lo=[ixMlo1,ixMlo2,ixMlo3]-1;lo(c)=lo(c)+1
-          do k=lo(3),hi(3)
-            do j=lo(2),hi(2)
-              do i=lo(1),hi(1)
-                idx=[i,j,k];gi=bc*bn+idx-[ixMlo1,ixMlo2,ixMlo3]
-                if(.not.((c/=2.and.(gi(2)==-1.or.gi(2)==nn(2)-1)).or. &
-                  (c/=3.and.(gi(3)==-1.or.gi(3)==nn(3)-1)))) cycle
-                if(.not.yy_ct_edge_is_owner(g,idx,c)) cycle
-                count=count+1
-                if(pass==2) receivers(:,count)=[g,idx,c]
+    integer :: pass,n,g,c,i,j,k,idx(3),gi(3),bc(3),lo(3),hi(3),bn(3),nn(3),count,l
+    logical :: local_needs_sync
+    integer :: local_count(refine_max_level),global_count(refine_max_level)
+    if(runtime_ct_epoch==particle_mesh_epoch) return
+    if(allocated(runtime_ct)) deallocate(runtime_ct)
+    local_count=0
+    do n=1,igridstail
+      l=node(plevel_,igrids(n))
+      local_count(l)=local_count(l)+1
+    end do
+    call MPI_ALLREDUCE(local_count,global_count,refine_max_level,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,ierrmpi)
+    allocate(runtime_ct(refine_max_level))
+    do l=1,refine_max_level
+      if(global_count(l)==0) cycle
+      call yy_prepare_ct_patch(runtime_ct(l)%patch,s,l)
+      call yy_prepare_ct_ghosts(runtime_ct(l)%ghosts,s,face_moments=yy_ct_face_moments,level=l)
+      bn=[block_nx1,block_nx2,block_nx3];nn=bn*[ng1(l),ng2(l),ng3(l)]
+      hi=[ixMhi1,ixMhi2,ixMhi3]
+      do pass=1,2
+        count=0
+        do n=1,igridstail
+          g=igrids(n)
+          if(node(plevel_,g)/=l) cycle
+          bc=[node(pig1_,g)-1,node(pig2_,g)-1,node(pig3_,g)-1]
+          do c=1,3
+            lo=[ixMlo1,ixMlo2,ixMlo3]-1;lo(c)=lo(c)+1
+            do k=lo(3),hi(3)
+              do j=lo(2),hi(2)
+                do i=lo(1),hi(1)
+                  idx=[i,j,k];gi=bc*bn+idx-[ixMlo1,ixMlo2,ixMlo3]
+                  if(.not.ct_seam_edge(gi,c,nn)) cycle
+                  ! The user prescribes inner tangential EMFs in each patch basis.
+                  if(special_inner_ct.and.c/=1.and.gi(1)==-1) cycle
+                  if(.not.yy_ct_edge_is_owner(g,idx,c)) cycle
+                  count=count+1
+                  if(pass==2) receivers(:,count)=[g,idx,c]
+                end do
               end do
             end do
           end do
         end do
+        if(pass==1) allocate(receivers(5,count))
       end do
-      if(pass==1) allocate(receivers(5,count))
+      call yy_prepare_ct_edges(runtime_ct(l)%edges,s,receivers,radial_extrapolate=.true.,level=l)
+      deallocate(receivers)
     end do
-    call yy_prepare_ct_edges(runtime_edges,s,receivers,radial_extrapolate=.true.)
+    ! A fixed-grid sampler can pack owner edges directly. Check once per
+    ! plan, so all ranks make the same decision about the first collective.
+    sync_edges_before_exchange=.true.
+    if(refine_max_level==1) then
+      local_needs_sync=.false.
+      associate(request=>runtime_ct(1)%edges%edge%samples%request)
+        do n=1,size(request,2)
+          idx=request(2:4,n)+[ixMlo1,ixMlo2,ixMlo3]
+          if(.not.yy_ct_edge_is_owner(request(1,n),idx,request(5,n))) then
+            local_needs_sync=.true.
+            exit
+          end if
+        end do
+      end associate
+      call MPI_ALLREDUCE(local_needs_sync,sync_edges_before_exchange,1,MPI_LOGICAL,MPI_LOR,MPI_COMM_WORLD,ierrmpi)
+    end if
+    runtime_ct_epoch=particle_mesh_epoch
     }
   end subroutine
 
   subroutine yy_runtime_ct_edges(s,fluxes)
     type(state),intent(in) :: s(max_blocks)
     type(ct_stage_flux),intent(inout) :: fluxes(:)
+    integer :: l
     call yy_runtime_ct_prepare(s)
-    call yy_ordered_ct_edges(runtime_patch,runtime_edges,fluxes)
+    if(sync_edges_before_exchange) then
+      do l=1,size(runtime_ct)
+        if(runtime_ct(l)%patch%mesh_epoch<0) cycle
+        call yy_sync_ct_edges(runtime_ct(l)%patch,fluxes)
+      end do
+    end if
+    do l=1,size(runtime_ct)
+      if(runtime_ct(l)%patch%mesh_epoch<0) cycle
+      call yy_exchange_ct_edges(runtime_ct(l)%edges,fluxes,defer_write=.true.)
+    end do
+    ! A fine receiver may use a coarse donor at the same stage and vice versa.
+    ! Commit no overset edge until every level has packed its native integrals.
+    do l=1,size(runtime_ct)
+      if(runtime_ct(l)%patch%mesh_epoch<0) cycle
+      call yy_write_ct_edges(runtime_ct(l)%edges,fluxes)
+      call yy_sync_ct_edges(runtime_ct(l)%patch,fluxes)
+    end do
   end subroutine
 
-  subroutine yy_runtime_ct_ghosts(s)
+  subroutine yy_runtime_ct_ghosts(s,sibling_faces_filled)
     type(state),intent(inout) :: s(max_blocks)
+    logical,optional,intent(in) :: sibling_faces_filled
+    integer :: l
+    logical :: sync_interior
+    sync_interior=.true.
+    ! After fixed-grid sibling exchange, interpolation reads active donor faces;
+    ! angular ghost closure does not depend on interior ghost copies.
+    if(present(sibling_faces_filled)) sync_interior=refine_max_level>1.or..not.sibling_faces_filled
     if(.not.associated(phys_ct_sync_center)) call mpistop('CT variable sync procedure is missing')
     call yy_runtime_ct_prepare(s)
-    call yy_complete_ct_faces(runtime_patch,runtime_ghosts,s)
+    do l=1,size(runtime_ct)
+      if(runtime_ct(l)%patch%mesh_epoch<0) cycle
+      if(sync_interior) call yy_sync_ct_faces(runtime_ct(l)%patch,s,.false.)
+      call yy_fill_ct_ghosts(runtime_ct(l)%ghosts,s,.true.,level=l)
+      call yy_sync_ct_faces(runtime_ct(l)%patch,s,.true.)
+    end do
+    call yy_ct_radial_faces(s)
     call yy_sync_ct_state(s,phys_ct_sync_center)
   end subroutine
 
   ! Supply radial cell donors before angular primitive interpolation. Final
   ! radial B/energy is recomputed only after all face and angular data are ready.
-  subroutine yy_ct_radial_cells(s)
-    type(state),intent(inout) :: s(max_blocks)
+  subroutine yy_ct_radial_cells(s,time,qdt)
+    use mod_usr_methods, only: usr_special_bc,usr_prepare_boundary
+    double precision,intent(in) :: time,qdt
+    type(state),target,intent(inout) :: s(max_blocks)
     {^IFTHREED
-    integer :: n,g,side,anchor,lo,hi,i
+    integer :: n,g,side,anchor,lo,hi,i,ixO^L
+    if(special_inner_ct.and.associated(usr_prepare_boundary)) call usr_prepare_boundary(time,qdt)
     do n=1,igridstail
       g=igrids(n)
       do side=1,2
         if(side==1.and.node(pig1_,g)/=1) cycle
-        if(side==2.and.node(pig1_,g)/=domain_nx1/block_nx1) cycle
+        if(side==2.and.node(pig1_,g)/=ng1(node(plevel_,g))) cycle
         anchor=ixMlo1;lo=ixGlo1;hi=ixMlo1-1
         if(side==2) then
           anchor=ixMhi1;lo=ixMhi1+1;hi=ixGhi1
@@ -611,6 +1295,12 @@ contains
         do i=lo,hi
           s(g)%w(i,ixGlo2:ixGhi2,ixGlo3:ixGhi3,:)=s(g)%w(anchor,ixGlo2:ixGhi2,ixGlo3:ixGhi3,:)
         end do
+        if(special_inner_ct.and.side==1) then
+          block=>s(g)
+          ^D&dxlevel(^D)=rnode(rpdx^D_,g);
+          ixO^L=ixG^LL;ixOmax1=hi
+          call usr_special_bc(qdt,time,ixG^LL,ixO^L,1,s(g)%w,s(g)%x)
+        end if
       end do
     end do
     }
@@ -640,7 +1330,9 @@ contains
   subroutine yy_checkpoint(filename,writing)
     character(len=*),intent(in) :: filename
     logical,intent(in) :: writing
-    integer :: u,ios,header(8),expected(8),imin,imax,version
+    integer :: u,ios,header(8),expected(8),imin,imax,version,saved_ranks,ranks_min,ranks_max
+    integer :: stored_version,version_min,version_max
+    logical :: allow_repartition
     integer(kind=8) :: bytes,saved_bytes
     double precision :: stamp,tmin,tmax
     if(.not.yinyang_enabled) return
@@ -652,6 +1344,9 @@ contains
     call MPI_ALLREDUCE(global_time,tmin,1,MPI_DOUBLE_PRECISION,MPI_MIN,MPI_COMM_WORLD,ierrmpi)
     call MPI_ALLREDUCE(global_time,tmax,1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
     if(imin/=imax.or.tmin/=tmax) call mpistop('yinyang checkpoint patch times disagree')
+    saved_ranks=yy_world_size
+    stored_version=2
+    allow_repartition=yy_ct_experimental.and.refine_max_level>1
     if(mype==0) then
       inquire(file=trim(filename),size=bytes,iostat=ios)
       if(ios/=0.or.bytes<=0) call mpistop('invalid yinyang checkpoint data size')
@@ -668,6 +1363,7 @@ contains
         read(u,*,iostat=ios) version
         if(ios/=0) call mpistop('invalid yinyang checkpoint metadata')
         rewind(u)
+        stored_version=version
         if(version==1) then
           read(u,*,iostat=ios) header(1:6)
           if(ios/=0) call mpistop('invalid legacy yinyang checkpoint metadata')
@@ -679,6 +1375,11 @@ contains
         else if(version==2) then
           read(u,*,iostat=ios) header
           if(ios/=0) call mpistop('invalid yinyang checkpoint header')
+          if(allow_repartition) then
+            saved_ranks=header(3)
+            if(saved_ranks<2.or.mod(saved_ranks,2)/=0) call mpistop('invalid yinyang checkpoint MPI size')
+            expected(3)=saved_ranks
+          end if
           if(any(header/=expected)) call mpistop('yinyang checkpoint mesh, patch, MPI or field mode mismatch')
           read(u,*,iostat=ios) imin,stamp,saved_bytes
           if(ios/=0) call mpistop('invalid yinyang checkpoint time and size')
@@ -690,6 +1391,16 @@ contains
       end if
       close(u,iostat=ios)
       if(ios/=0) call mpistop('cannot close yinyang checkpoint metadata')
+    end if
+    if(.not.writing.and.allow_repartition) then
+      call MPI_BCAST(stored_version,1,MPI_INTEGER,0,icomm,ierrmpi)
+      call MPI_BCAST(saved_ranks,1,MPI_INTEGER,0,icomm,ierrmpi)
+      call MPI_ALLREDUCE(stored_version,version_min,1,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierrmpi)
+      call MPI_ALLREDUCE(stored_version,version_max,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+      call MPI_ALLREDUCE(saved_ranks,ranks_min,1,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierrmpi)
+      call MPI_ALLREDUCE(saved_ranks,ranks_max,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+      if(ranks_min/=ranks_max.or.version_min/=version_max) &
+        call mpistop('paired yinyang checkpoint MPI size or versions disagree')
     end if
     call MPI_BARRIER(MPI_COMM_WORLD,ierrmpi)
     if(mype==0) then
@@ -726,6 +1437,7 @@ contains
     call MPI_REDUCE(exchange_calls,calls_min,1,MPI_INTEGER8,MPI_MIN,0,MPI_COMM_WORLD,ierrmpi)
     call MPI_REDUCE(exchange_calls,calls_max,1,MPI_INTEGER8,MPI_MAX,0,MPI_COMM_WORLD,ierrmpi)
     if(yy_world_rank==0) then
+      if(refine_max_level>1) write(*,'(a)') 'Yin-Yang level-one exchange statistics'
       average=average/yy_world_size
       write(*,'(a,4es14.6)') 'Yin-Yang max-rank build / pack / exchange / unpack seconds: ',maximum
       write(*,'(a,4es14.6)') 'Yin-Yang mean-rank build / pack / exchange / unpack seconds: ',average
@@ -733,6 +1445,7 @@ contains
       write(*,'(a,2i14)') 'Yin-Yang payload bytes raw / unique per exchange: ',totals*int(nw,8)*8_8
       write(*,'(a,2i14)') 'Yin-Yang exchange calls min / max: ',calls_min,calls_max
     end if
+    if(refine_max_level>1) call yy_glm_report()
   end subroutine
 
   ! Deduplicate requests for each sending peer. Only schedule construction uses
@@ -788,20 +1501,6 @@ contains
     outreq=compact(:,1:nr)
   end subroutine
 
-  pure subroutine yy_basis(theta,phi,patch,b)
-    double precision,intent(in) :: theta,phi
-    integer,intent(in) :: patch
-    double precision,intent(out) :: b(3,3)
-    double precision :: tmp(3)
-    b(:,1)=[sin(theta)*cos(phi),sin(theta)*sin(phi),cos(theta)]
-    b(:,2)=[cos(theta)*cos(phi),cos(theta)*sin(phi),-sin(theta)]
-    b(:,3)=[-sin(phi),cos(phi),0.d0]
-    if(patch==1) then
-      b(1,:)=-b(1,:)
-      tmp=b(2,:); b(2,:)=b(3,:); b(3,:)=tmp
-    end if
-  end subroutine
-
   pure subroutine yy_position(r,theta,phi,patch,v)
     double precision,intent(in) :: r,theta,phi
     integer,intent(in) :: patch
@@ -812,6 +1511,8 @@ contains
   end subroutine
 
   subroutine yy_validate()
+    use mod_usr_methods, only: usr_special_bc,usr_set_electric_field
+    integer :: iw
     if(yy_ct_face_moments.and..not.yy_ct_experimental)call mpistop('face moments require experimental YY CT')
     if(yy_ct_experimental.and..not.yinyang_enabled) call mpistop('YY CT requires yinyang coordinates')
     if(.not.yinyang_enabled) return
@@ -819,15 +1520,37 @@ contains
     if(yy_ct_experimental) then
       if(.not.stagger_grid.or.physics_type/='mhd'.or..not.ct_stage_split.or. &
         .not.associated(phys_ct_sync_center).or..not.associated(phys_get_ct_edges).or. &
-        .not.associated(phys_apply_ct_edges)) call mpistop('YY CT needs staged classical total-energy UCT-HLL')
+        .not.associated(phys_apply_ct_edges)) call mpistop('YY CT needs staged classical UCT-HLL with cell-center synchronization')
       if(dimsplit.or.t_stepper/=threestep.or.t_integrator/=ssprk3.or.internalboundary) &
         call mpistop('YY CT needs unsplit SSPRK3; no internal boundaries')
-      if(any(typeboundary(:,1:2)/=bc_cont)) call mpistop('YY CT requires continuous radial boundaries')
+      if(any(typeboundary(:,2)/=bc_cont)) call mpistop('YY CT requires a continuous outer boundary')
+      special_inner_ct=any(typeboundary(:,1)==bc_special)
+      do iw=1,nw
+        if(special_inner_ct.and..not.any(iw_mag==iw)) then
+          if(typeboundary(iw,1)/=bc_special) call mpistop('YY CT inner fluid variables must all be special')
+        else
+          if(typeboundary(iw,1)/=bc_cont) call mpistop('YY CT requires continuous inner magnetic boundaries')
+        end if
+      end do
+      if(special_inner_ct.and.(.not.associated(usr_special_bc).or..not.associated(usr_set_electric_field))) &
+        call mpistop('YY CT special inner boundary requires fluid and electric field callbacks')
     else if(stagger_grid) then
       call mpistop('Yin-Yang CT requires explicit yy_ct_experimental=T')
     end if
-    if(refine_max_level/=1.or.lb_automatic.or.local_timestep) &
-      call mpistop('yinyang v1 requires fixed level-one mesh and global time stepping')
+    if(lb_automatic.or.local_timestep) &
+      call mpistop('Yin-Yang requires global time steps and no cost-weighted balancing')
+    if(refine_max_level>1) then
+      if(yy_ct_experimental.and.any(int([domain_nx1,domain_nx2,domain_nx3],8) &
+        *2_8**(refine_max_level-1)>huge(1))) call mpistop('Yin-Yang CT AMR cell indices exceed capacity')
+      if(physics_type/='mhd'.or.internalboundary) &
+        call mpistop('Yin-Yang AMR requires MHD without internal boundaries')
+      if(any(int([domain_nx1/block_nx1,domain_nx2/block_nx2,domain_nx3/block_nx3],8) &
+        *2_8**(refine_max_level-1)>huge(1))) call mpistop('Yin-Yang AMR native block indices exceed capacity')
+      if(2*nghostcells>min(block_nx1,block_nx2,block_nx3)) &
+        call mpistop('Yin-Yang AMR requires block widths of at least twice the ghost width')
+      if(level_io>0.or.level_io_min/=1.or.level_io_max/=nlevelshi) &
+        call mpistop('Yin-Yang AMR does not support forced output refinement levels')
+    end if
     if(B0field.or.use_particles.or.use_multigrid) &
       call mpistop('yinyang v1: B0, particles and multigrid are unsupported')
     if(any(periodB).or.any(aperiodB)) call mpistop('yinyang has no periodic boundary')
@@ -842,10 +1565,53 @@ contains
     }
   end subroutine
 
+  ! Called by both patches after the ordinary AMR mesh update. Layout epochs
+  ! are patch-local and may diverge even though the next exchange is collective.
+  subroutine yy_invalidate_after_regrid()
+    integer :: changed,any_changed
+    changed=merge(1,0,epoch/=particle_mesh_epoch)
+    call MPI_ALLREDUCE(changed,any_changed,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+    if(any_changed/=0) then
+      epoch=-1_8
+      runtime_ct_epoch=-1_8
+      {^IFTHREED ct_directory_epoch=-1_8 }
+      glm_mode_known=.false.
+      call yy_glm_invalidate()
+    end if
+  end subroutine
+
+  ! All ranks use the level-one schedule while both patches are fully coarse.
+  subroutine yy_refresh_glm_mode(mixed)
+    logical,intent(out) :: mixed
+    integer :: highest
+    mixed=.false.
+    if(.not.yinyang_enabled.or.refine_max_level==1) return
+    if(.not.glm_mode_known) then
+      call MPI_ALLREDUCE(levmax,highest,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+      glm_mode_mixed=highest>1
+      glm_mode_known=.true.
+      ! The mesh epoch is consumed by whichever schedule is active.
+      if(glm_mode_mixed) epoch=particle_mesh_epoch
+    end if
+    mixed=glm_mode_mixed
+  end subroutine
+
+  ! Intersect this level-one block with the angular domain.
+  subroutine yy_angular_interior(g,lo,hi)
+    integer,intent(in) :: g
+    integer,intent(out) :: lo(2),hi(2)
+    {^IFTHREED
+    integer :: offset(2)
+    offset=([node(pig2_,g),node(pig3_,g)]-1)*[block_nx2,block_nx3]
+    lo=[ixMlo2,ixMlo3]-offset
+    hi=lo+[domain_nx2,domain_nx3]-1
+    }
+  end subroutine
+
   subroutine yy_build(s)
     type(state),intent(in) :: s(max_blocks)
     {^IFTHREED
-    integer :: nblocks,nlocal,n,g,a,b,j,k,i,q,t,p,off,dj,dk,bi,bj,bk,ci,cj,ck,pass,gi,gj,gk
+    integer :: nblocks,nlocal,n,g,a,b,j,k,i,q,t,p,off,dj,dk,bi,bj,bk,ci,cj,ck,pass,gi,lo(2),hi(2)
     integer,allocatable :: counts(:),displs(:),local(:,:),allblocks(:,:),owners(:,:,:,:),ids(:,:,:,:)
     integer,allocatable :: outreq(:,:),cursor(:),sc4(:),rc4(:),sd4(:),rd4(:)
     double precision :: v(3),theta,phi,aa,bb,wa,wb,dteta,dphi,mat(3,3)
@@ -854,6 +1620,7 @@ contains
     end if
     allocate(counts(yy_world_size),displs(yy_world_size))
     nlocal=igridstail
+    if(any(node(plevel_,igrids(1:nlocal))/=1)) call mpistop('Yin-Yang level-one exchange needs a fully coarse mesh')
     allocate(local(5,nlocal))
     do n=1,nlocal
       g=igrids(n)
@@ -883,12 +1650,12 @@ contains
     do pass=1,2
       t=0
       do n=1,nlocal
-        g=igrids(n)
+        g=local(4,n)
+        call yy_angular_interior(g,lo,hi)
+        if(all(lo<=[ixGlo2,ixGlo3]).and.all(hi>=[ixGhi2,ixGhi3])) cycle
         do k=ixGlo3,ixGhi3
-          gk=(node(pig3_,g)-1)*block_nx3+k-ixMlo3
           do j=ixGlo2,ixGhi2
-            gj=(node(pig2_,g)-1)*block_nx2+j-ixMlo2
-            if(gj>=0.and.gj<domain_nx2.and.gk>=0.and.gk<domain_nx3) cycle
+            if(j>=lo(1).and.j<=hi(1).and.k>=lo(2).and.k<=hi(2)) cycle
             theta=s(g)%x(ixMlo1,j,k,2); phi=s(g)%x(ixMlo1,j,k,3)
             v=[-sin(theta)*cos(phi),cos(theta),sin(theta)*sin(phi)]
             theta=atan2(sqrt(v(1)**2+v(2)**2),v(3));phi=atan2(v(2),v(1))
@@ -960,8 +1727,9 @@ contains
     do t=nt,1,-1
       g=rec(1,t);rnext(t)=rhead(g);rhead(g)=t
     end do
+    if(yy_world_rank==0.and.(refine_max_level==1.or.exchange_calls==0_8)) &
+      write(*,'(a,i0,a,i0)') 'Yin-Yang schedule: rank 0 receivers=',nt,', samples=',ns
     epoch=particle_mesh_epoch
-    if(yy_world_rank==0) write(*,'(a,i0,a,i0)') 'Yin-Yang schedule: rank 0 receivers=',nt,', samples=',ns
     }
   end subroutine
 
@@ -969,16 +1737,15 @@ contains
     type(state),target,intent(inout) :: s(max_blocks)
     integer,intent(in) :: nwstart,nwbc
     {^IFTHREED
-    integer :: n,g,t,i,j,k,q,iv,iw,p,nh,side,axis,ixO^L,lo(3),hi(3),bn(3),dn(3)
+    integer :: n,g,t,i,j,k,q,iv,iw,p,nh,side,axis,ixO^L,lo(3),hi(3),angular_lo(2),angular_hi(2)
     double precision :: v(3),val(nw),t0
     if(nwstart/=1.or.nwbc/=nw) call mpistop('yinyang partial-state exchange unsupported')
-    if(epoch/=particle_mesh_epoch) then
+    if(epoch==-1_8.or.(refine_max_level==1.and.epoch/=particle_mesh_epoch)) then
       t0=MPI_WTIME()
       call yy_build(s)
       build_seconds=build_seconds+MPI_WTIME()-t0
     end if
     exchange_calls=exchange_calls+1_8
-    bn=[block_nx1,block_nx2,block_nx3];dn=[domain_nx1,domain_nx2,domain_nx3]
     t0=MPI_WTIME()
     do n=1,igridstail
       g=igrids(n)
@@ -986,10 +1753,9 @@ contains
       block=>s(g)
       scratch=s(g)%w
       ixO^L=ixG^LL;
-      ixOmin2=max(ixGlo2,ixMlo2-(node(pig2_,g)-1)*block_nx2)
-      ixOmax2=min(ixGhi2,ixMlo2+domain_nx2-1-(node(pig2_,g)-1)*block_nx2)
-      ixOmin3=max(ixGlo3,ixMlo3-(node(pig3_,g)-1)*block_nx3)
-      ixOmax3=min(ixGhi3,ixMlo3+domain_nx3-1-(node(pig3_,g)-1)*block_nx3)
+      call yy_angular_interior(g,angular_lo,angular_hi)
+      ixOmin2=max(ixGlo2,angular_lo(1));ixOmax2=min(ixGhi2,angular_hi(1))
+      ixOmin3=max(ixGlo3,angular_lo(2));ixOmax3=min(ixGhi3,angular_hi(2))
       call phys_to_primitive(ixG^LL,ixO^L,scratch,s(g)%x)
       t=shead(g)
       do while(t/=0)
@@ -1036,17 +1802,18 @@ contains
         t=rnext(t)
       end do
       ! Convert rectangular ghost slabs in bulk; every read cell was filled above.
+      call yy_angular_interior(g,angular_lo,angular_hi)
       do axis=2,3
         do side=1,2
           lo=[ixGlo1,ixGlo2,ixGlo3];hi=[ixGhi1,ixGhi2,ixGhi3]
           if(side==1) then
-            hi(axis)=nghostcells-(node(plevel_+axis,g)-1)*bn(axis)
+            hi(axis)=angular_lo(axis-1)-1
           else
-            lo(axis)=nghostcells+dn(axis)-(node(plevel_+axis,g)-1)*bn(axis)+1
+            lo(axis)=angular_hi(axis-1)+1
           end if
           if(axis==3) then
-            lo(2)=max(ixGlo2,ixMlo2-(node(pig2_,g)-1)*block_nx2)
-            hi(2)=min(ixGhi2,ixMlo2+domain_nx2-1-(node(pig2_,g)-1)*block_nx2)
+            lo(2)=max(ixGlo2,angular_lo(1))
+            hi(2)=min(ixGhi2,angular_hi(1))
           end if
           if(any(lo>hi)) cycle
           ixOmin1=lo(1);ixOmin2=lo(2);ixOmin3=lo(3)

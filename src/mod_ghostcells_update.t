@@ -401,7 +401,8 @@ contains
     use mod_boundary_conditions, only: getintbc, bc_phys
     use mod_comm_lib, only: mpistop
     use mod_timing, only: timer_open, timer_close
-    use mod_yinyang, only: yy_exchange,yy_ct_radial_cells,yy_runtime_ct_ghosts
+    use mod_yinyang, only: yy_exchange,yy_ct_radial_cells,yy_runtime_ct_ghosts,yy_refresh_glm_mode
+    use mod_yinyang_glm_amr, only: yy_glm_exchange
 
     double precision, intent(in)      :: time, qdt
     type(state), target               :: psb(max_blocks)
@@ -418,9 +419,26 @@ contains
     ! shapes of reshape
     integer, dimension(1) :: shapes
     type(wbuffer) :: pwbuf(npwbuf)
+    logical :: mixed_glm
+    ! Only remote siblings use these slots; restriction shares the MPI request list.
+    type sibling_receive
+      integer :: grid, dir^D
+      double precision, allocatable :: values(:^D&,:)
+    end type
+    type(sibling_receive), allocatable, save :: sibling_recv(:)
+    integer :: nsibling, slot, ixR^L
 
     call timer_open(tbc)
+    call yy_refresh_glm_mode(mixed_glm)
+    if(mixed_glm.and.(nwstart/=1.or.nwbc/=nw)) call mpistop('yinyang partial-state exchange unsupported')
 
+    if(ghostcell_sibling_recv_buffer) then
+      if(allocated(sibling_recv)) then
+        if(size(sibling_recv)/=nrecv_bc_srl) deallocate(sibling_recv)
+      end if
+      if(.not.allocated(sibling_recv)) allocate(sibling_recv(nrecv_bc_srl))
+    end if
+    nsibling=0
     nwhead=nwstart
     nwtail=nwstart+nwbc-1
 
@@ -493,6 +511,12 @@ contains
 
     call waitall_limited(irecv_c,recvrequest_c_sr,recvstatus_c_sr)
     call waitall_pending(isend_c,flushed_send_c,sendrequest_c_sr,sendstatus_c_sr)
+    do slot=1,nsibling
+      associate(msg=>sibling_recv(slot))
+        ixR^L=ixR_srl_^L(msg%dir^D);
+        psb(msg%grid)%w(ixR^S,nwhead:nwtail)=msg%values(:^D&,1:nwbc)
+      end associate
+    end do
     if(stagger_grid) then
       call waitall_limited(nrecv_bc_srl,recvrequest_srl,recvstatus_srl)
       call waitall_pending(nsend_bc_srl,flushed_send_srl,sendrequest_srl,sendstatus_srl)
@@ -598,6 +622,10 @@ contains
     end do
     !$OMP END PARALLEL DO
 
+    ! Mixed-level radial corners follow the receiving block's physical BC.
+    ! Supply its angular ghosts inside the radial domain before that BC runs.
+    if(mixed_glm) call yy_glm_exchange(psb,.false.)
+
     ! fill physical boundary ghost cells after internal ghost-cell values exchange
     if(bcphys.and..not.yy_ct_experimental) then
       if(associated(usr_prepare_boundary)) then
@@ -614,7 +642,8 @@ contains
     ! Radial divB closure differentiates across angular patch boundaries. Fill
     ! those donors first; the final exchange below then propagates the corrected
     ! radial ghosts to the other patch's radial/angular corners.
-    if(bcphys.and.yy_radial_boundary_adjust) call yy_exchange(psb,nwstart,nwbc)
+    if(bcphys.and.yy_radial_boundary_adjust.and..not.yy_ct_experimental.and..not.mixed_glm) &
+      call yy_exchange(psb,nwstart,nwbc)
 
      ! modify normal component of magnetic field to fix divB=0 
     if(bcphys.and.associated(phys_boundary_adjust).and..not.yy_ct_experimental) then
@@ -626,9 +655,13 @@ contains
       !$OMP END PARALLEL DO
     end if
 
-    if(yy_ct_experimental) call yy_ct_radial_cells(psb)
-    if(yinyang_enabled) call yy_exchange(psb,nwstart,nwbc)
-    if(yy_ct_experimental) call yy_runtime_ct_ghosts(psb)
+    if(yy_ct_experimental) call yy_ct_radial_cells(psb,time,qdt)
+    if(mixed_glm) then
+      if(.not.yy_ct_experimental) call yy_glm_exchange(psb,.true.)
+    else if(yinyang_enabled) then
+      call yy_exchange(psb,nwstart,nwbc)
+    end if
+    if(yy_ct_experimental) call yy_runtime_ct_ghosts(psb,sibling_faces_filled=.true.)
 
     ! EoS work in the boundary conditions and level-jump conversions is counted under the EoS
     time_bc=time_bc+timer_close(tbc)
@@ -730,6 +763,9 @@ contains
            kmax3=merge(1, 0, idims .lt. 3 .and. neighbor_type(0,0, 1,igrid)==1)}
           ixBmin^D=ixGlo^D+kmin^D*nghostcells;
           ixBmax^D=ixGhi^D-kmax^D*nghostcells;
+          if(mixed_glm) then
+            ixB^L=ixG^LL;
+          end if
           do iside=1,2
             i^D=kr(^D,idims)*(2*iside-3);
             if (aperiodB(idims)) then 
@@ -774,14 +810,32 @@ contains
       subroutine bc_recv_srl(igrid,i^D)
         integer, intent(in) :: igrid,i^D
 
-        integer :: ipe_neighbor
+        integer :: ipe_neighbor, ixR^L, extents(ndim+1)
 
         ipe_neighbor=neighbor(2,i^D,igrid)
         if (ipe_neighbor/=mype) then
            irecv_c=irecv_c+1
            itag=(3**^ND+4**^ND)*(igrid-1)+{(i^D+1)*3**(^D-1)+}
-           call MPI_IRECV(psb(igrid)%w,1,type_recv_srl(i^D), &
-                          ipe_neighbor,itag,icomm,recvrequest_c_sr(irecv_c),ierrmpi)
+           if(ghostcell_sibling_recv_buffer) then
+             nsibling=nsibling+1
+             associate(msg=>sibling_recv(nsibling))
+               msg%grid=igrid
+               ^D&msg%dir^D=i^D;
+               ixR^L=ixR_srl_^L(i^D);
+               ^D&extents(^D)=ixRmax^D-ixRmin^D+1;
+               extents(ndim+1)=nwbc
+               if(allocated(msg%values)) then
+                 extents(ndim+1)=max(nwbc,size(msg%values,ndim+1))
+                 if(any(shape(msg%values)/=extents)) deallocate(msg%values)
+               end if
+               if(.not.allocated(msg%values)) allocate(msg%values(ixR^S,extents(ndim+1)))
+               call MPI_IRECV(msg%values,product(extents(1:ndim))*nwbc,MPI_DOUBLE_PRECISION, &
+                              ipe_neighbor,itag,icomm,recvrequest_c_sr(irecv_c),ierrmpi)
+             end associate
+           else
+             call MPI_IRECV(psb(igrid)%w,1,type_recv_srl(i^D), &
+                            ipe_neighbor,itag,icomm,recvrequest_c_sr(irecv_c),ierrmpi)
+           end if
            if(stagger_grid) then
              irecv_srl=irecv_srl+1
              call MPI_IRECV(recvbuffer_srl(ibuf_recv_srl),sizes_srl_recv_total(i^D),MPI_DOUBLE_PRECISION, &

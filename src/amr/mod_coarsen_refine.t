@@ -31,17 +31,47 @@ contains
     use mod_functions_forest, only: coarsen_tree_leaf,refine_tree_leaf
     use mod_selectgrids, only: selectgrids
     use mod_refine, only: refine_grids
+    use mod_yinyang, only: yy_invalidate_after_regrid
+    {^IFTHREED
+    use mod_yinyang, only: yy_ct_balance
+    }
+    use mod_yinyang_glm_amr, only: yy_glm_balance
 
 
     use mod_multigrid_coupling
 
     integer :: iigrid, igrid, ipe, igridCo, ipeCo, level, ic^D
     integer, dimension(2^D&) :: igridFi, ipeFi
-    integer :: n_coarsen, n_refine
+    integer :: n_coarsen, n_refine, n_deferred
     type(tree_node_ptr) :: tree, sibling
-    logical             :: active
+    logical             :: active, changed
+    logical,allocatable :: deferred(:,:)
 
-    call proper_nesting
+    if(yinyang_enabled.and.refine_max_level>1) then
+      allocate(deferred(max_blocks,0:npe-1))
+      deferred=.false.
+      do
+        do
+          n_deferred=count(deferred)
+          call proper_nesting(deferred)
+          if(count(deferred)==n_deferred) exit
+        end do
+        {^IFTHREED
+        if(yy_ct_experimental) then
+          call yy_glm_balance(changed,deferred,yy_ct_balance)
+        else
+          call yy_glm_balance(changed,deferred)
+        end if
+        }
+        {^NOONED
+        {^IFTWOD call yy_glm_balance(changed,deferred) }
+        }
+        {^IFONED call yy_glm_balance(changed,deferred) }
+        if(.not.changed) exit
+      end do
+    else
+      call proper_nesting
+    end if
 
     if(stagger_grid) then
       call store_faces
@@ -166,6 +196,9 @@ contains
     call selectgrids
     !  grid structure now complete again.
 
+    ! Both patches reach this point even when one patch had no tree changes.
+    if(yinyang_enabled.and.refine_max_level>1) call yy_invalidate_after_regrid()
+
     ! since we only filled mesh values, and advance assumes filled
     ! ghost cells, do boundary filling for the new levels
     call getbc(global_time,0.d0,ps,iwstart,nwgc)
@@ -211,11 +244,12 @@ contains
 
   !> For all grids on all processors, do a check on refinement flags. Make
   !> sure that neighbors will not differ more than one level of refinement.
-  subroutine proper_nesting
+  subroutine proper_nesting(deferred)
     use mod_forest
     use mod_global_parameters
     use mod_amr_neighbors, only: find_neighbor
 
+    logical,intent(inout),optional :: deferred(max_blocks,0:npe-1)
     logical, dimension(:,:), allocatable :: refine2
     integer :: iigrid, igrid, level, ic^D, inp^D, i^D, my_neighbor_type,ipe
     logical :: coarsening, pole(ndim), sendbuf(max_blocks)
@@ -233,6 +267,8 @@ contains
                           MPI_LOGICAL,icomm,ierrmpi)
     end if
 
+    if(present(deferred)) where(deferred) refine=.false.
+
     do level=min(levmax,refine_max_level-1),levmin+1,-1
        tree%node => level_head(level)%node
        do
@@ -248,7 +284,13 @@ contains
                    if (.not.associated(p_neighbor%node)) cycle
                 end if\}
                 if (p_neighbor%node%leaf) then
-                   refine(p_neighbor%node%igrid,p_neighbor%node%ipe)=.true.
+                   if(present(deferred)) then
+                     if(deferred(p_neighbor%node%igrid,p_neighbor%node%ipe)) then
+                       refine(tree%node%igrid,tree%node%ipe)=.false.
+                       deferred(tree%node%igrid,tree%node%ipe)=.true.
+                     end if
+                   end if
+                   if(refine(tree%node%igrid,tree%node%ipe)) refine(p_neighbor%node%igrid,p_neighbor%node%ipe)=.true.
                 end if
              {end do\}
           end if

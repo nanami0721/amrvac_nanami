@@ -20,7 +20,7 @@ contains
     ! level=1 grids have been formed and initialized. This subroutine
     ! creates and initializes new level grids
 
-    integer :: igrid, iigrid, levnew
+    integer :: igrid, iigrid, levnew, reached, any_reached
 
     ! when only one level allowed, there is nothing to do anymore
     if (refine_max_level == 1) return
@@ -33,7 +33,13 @@ contains
 
        if (.not.reset_grid) then
          ! if no finer level grids created: exit
-         if (levmax/=levnew) exit
+         if(yinyang_enabled) then
+           reached=merge(1,0,levmax>=levnew)
+           call MPI_ALLREDUCE(reached,any_reached,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierrmpi)
+           if(any_reached==0) exit
+         else
+           if(levmax/=levnew) exit
+         end if
        end if
     end do
 

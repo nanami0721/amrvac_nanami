@@ -1,8 +1,9 @@
 # Experimental Yin–Yang grid v1
 
-> For the current scope freeze and a fresh-machine handoff, read
-> [Mac Studio handoff](../YINYANG_MAC_STUDIO_HANDOFF.md) first. Historical status
-> notes below are dated evidence, not the current task queue.
+> For the fixed-grid scope and a fresh-machine setup, see the
+> [Mac Studio handoff](../YINYANG_MAC_STUDIO_HANDOFF.md). The
+> [GLM MHD AMR](#glm-mhd-amr) and [experimental CT AMR](#experimental-ct-amr)
+> sections describe the adaptive paths.
 
 > Recovery note (2026-11-16): the historical temporary artifacts cited below were lost during a reboot. The implementation was reconstructed from session edit records. Fresh accuracy evidence and its validation scope are in `yinyang_accuracy_diagnosis.md`; the historical six-configuration and timing statements below were not all rerun during recovery.
 
@@ -23,29 +24,122 @@ proper rotation `(x,y,z) -> (-x,z,y)` of the Yin frame.
 
 ## Supported scope
 
-- 3D3V, positive-radius shell; two identical fixed level-one meshes.
+- 3D3V, positive-radius shell, with matching level-one meshes on the two patches.
 - Even MPI world size >= 2; contiguous equal groups own Yin and Yang. `mype`,
   `npe`, `icomm`, forest and block identifiers are **patch local** after startup.
   `yy_world_rank`, `yy_world_size`, `yy_patch` identify the global arrangement.
-- Ideal total-energy MHD with GLM and FI ideal-gas EOS. Ideal HD and scalar
-  transport are available for infrastructure tests.
+- Ideal GLM MHD with the FI ideal-gas EOS supports total energy and internal
+  energy (`mhd_internal_e=T`). Angular interpolation uses primitive pressure in both formulations.
+  Each patch evaluates the internal-energy pressure work using the local
+  spherical metric and the exchanged velocity ghosts. Experimental CT supports both energy formulations. The outer radial boundary
+  uses `cont`. The inner boundary supports either `cont` for all variables or
+  `special` for all fluid variables with `cont` for the magnetic components.
+  In the latter mode `usr_special_bc` supplies conserved fluid ghost data and
+  `usr_set_electric_field` must prescribe **both** inner tangential edge integrals
+  (including the substep time factor) in each local patch basis. Shared edges
+  within a patch retain their single-owner synchronization. At the inner surface
+  the user integrals take precedence over cross-patch interpolation. CT evolves
+  the normal face flux and closes radial magnetic ghosts from the active faces. For internal energy, face-to-center synchronization updates the
+  magnetic components directly. The stored thermal energy needs no correction. Ideal HD and scalar transport are available for infrastructure tests.
 - Uniform angular spacing and matching radial discretization. The supplied
   tests use TVDLF, minmod and three-step integration.
-- Existing radial physical boundary routines; angular external ghosts are
-  supplied exclusively by the other patch, including edge/corner ghosts.
+- Angular overset exchange supplies exterior angular ghost cells. The
+  receiving block applies its radial boundary at mixed-level physical
+  corners and at all adaptive CT physical corners. GLM same-level corner
+  stencils use the opposite patch's radial ghost data.
 
-AMR, automatic migration/load balancing, local timesteps, non-experimental CT, B0 splitting,
-particles, multigrid, angular periodicity, partial-state exchange, extra/auxiliary
-state and additional HD/MHD source modules other than optional MHD user gravity are rejected.
+Cost-weighted automatic load balancing, local timesteps, non-experimental CT,
+B0 splitting, particles, multigrid, angular periodicity, partial-state exchange,
+extra/auxiliary state and additional HD/MHD source modules other than optional
+MHD user gravity are rejected.
 Central gravity has passed the equilibrium validation described below; coronal conduction/radiation remain unsupported. User source and boundary callbacks
 must use the appropriate patch frame; no automatic transformation of arbitrary
 user callbacks is possible. Scalar prescribed velocities are likewise local
 components, not automatically a common Cartesian velocity on both patches.
 
-## Exchange and costs
+## GLM MHD AMR
 
-`mod_yinyang` gathers ownership once and caches donor indices, bilinear weights,
-basis matrices and peer schedules. Runtime messages carry primitive states;
+Set `refine_max_level>1` to enable adaptive Yin–Yang GLM MHD, up to the native
+limit `nlevelshi=20`. Refinement can reach the overset interface. The block
+width on each axis must be at least twice the ghost width. This path uses
+cell-centered ideal GLM MHD and global time stepping. HD and scalar
+transport use fixed level-one grids. The GLM AMR path excludes internal
+boundaries and forced output-level refinement via `level_io`, `level_io_min`
+or `level_io_max`.
+
+Before editing either tree, each rank checks the actual angular ghost stencil
+on its proposed leaves. Native nesting and cross-patch checks repeat until
+the proposal satisfies a one-level bound between every receiver and the
+leaves its stencil uses. The check cancels conflicting sibling coarsening
+and requests coarse-side refinement as needed. A split can be deferred to
+a subsequent regrid when the proposal would require two generations at once.
+Each patch retains its own tree and Morton ownership. Both patches take
+the same startup and regrid collective paths, including cases where only
+one patch changes. Ownership and exchange tables rebuild after topology
+changes, migration and a paired checkpoint restart. The sparse leaf lookup
+uses native block tuples and 64-bit cell addresses.
+
+The receiving level defines a virtual donor grid. Four angular samples
+supply the bilinear interpolation. An equal-level sample takes the native
+primitive state. A coarser leaf reconstructs the sample with minmod slopes
+and physical coordinate distances. A finer leaf supplies the volume mean
+of its eight conserved child cells, which is converted to primitives before
+angular interpolation. Vector samples and slopes use a common Cartesian
+basis. The reconstructed density and pressure retain the positive donor
+center value if reconstruction would make either nonpositive. Both native
+radial stretch modes use their physical radial geometry.
+
+For mixed-level physical radial corners, the receiving block supplies its
+radial boundary condition after angular exchange has filled the radial
+interior. The normal GLM boundary adjustment then uses those current angular
+ghosts. Same-level corner stencils exchange the donor's radial ghost values.
+When all leaves are level one, the original exchange plan supplies faces
+and corners. The run summary reports level-one and mixed-layout exchange
+costs separately. The two-level interior regression in `tests/yinyang/glm_amr`
+checks migration, paired restart and fixed-grid and native spherical controls.
+`tests/yinyang/glm_amr_cross` exercises refinement at the interface, mixed-level
+donor transfer and radial corner closure.
+
+## Experimental CT AMR
+
+Enable the existing `ct_stage_split=T` and `yy_ct_experimental=T` options
+with `time_stepper='threestep'`, the CT divergence treatment, and UCT-HLL.
+Allow refinement by setting `refine_max_level>1` with the ordinary mesh and
+refinement controls. TVDLF and HLL are supported at every level. Classical
+total and internal energy, uniform angular spacing, global unsplit SSPRK3,
+and the radial boundary choices above apply. Blocks need at least twice the
+ghost width on every axis.
+
+Each patch uses native CT prolongation, restriction and edge reflux. The
+opposite-patch plan checks the proposed ghost face and RK edge donor
+stencils before each regrid and allows at most a one-level jump. It
+constructs virtual donor-lattice face fluxes and edge integrals from the
+true leaf data. Fine subface fluxes and fine collinear edge integrals add
+with their native measures. The tensor prolongation acts on oriented
+fluxes and line integrals before reconstructing and projecting vectors
+onto the receiving patch. Native shared edges use the geometric owner at
+their level. Fine segments take precedence when supplying an aligned
+coarse edge donor on a coarse/fine junction.
+
+The exchange packs donor edge values at all levels before any overset
+updates. Each active face advances by the CT curl and the native reflux
+correction. Magnetic overset interpolation and divergence closure operate
+on ghost faces. The process preserves user-prescribed tangential edges
+at the physical inner wall. This is a discretely solenoidal patch
+update with approximate, rotated overset coupling. It supplies neither
+a single global overset flux nor an exact curl commutator across the seam.
+
+See [the stage API](yinyang_ct_stage_api.md#adaptive-ct-stage-and-ghosts) for
+the exchange sequence and [the CT AMR tests](../tests/yinyang/ct_amr/README.md)
+for the validation inputs.
+
+## Level-one exchange and costs
+
+The level-one schedule handles fixed-grid runs and phases of an adaptive
+run when both patches have only level-one leaves. `mod_yinyang` gathers
+ownership at startup and after changes in the AMR layout. It caches donor
+indices, bilinear weights, basis matrices and peer schedules. Level-one
+runtime messages carry primitive states;
 velocity and magnetic field are interpolated in the global Cartesian frame and
 rotated into the receiver basis. Scalar primitives, including GLM psi, use the
 same convex weights. Existing physics conversions restore conserved variables.
@@ -79,8 +173,10 @@ staggered/background-field flags, step, time and data-file size), plus a
 `.dat.yy.complete` record. Before overwriting a snapshot, both patches invalidate
 their old completion records. Completion records are published only after both
 patch data files and metadata have closed. Restart requires both snapshots,
-sidecars and completion records, unchanged MPI size, and the literal filename
-placeholder:
+sidecars and completion records and the literal filename placeholder.
+Version-2 CT AMR snapshots can be read with a different valid even MPI world
+size. The stored size and version must agree across the two patch sidecars.
+Other modes retain the original MPI-size check.
 
 ```sh
 mpirun -np 4 ./amrvac -if 'yy_{patch}0001.dat'
@@ -144,7 +240,7 @@ Detailed results/build copies are outside the repository at
 - At common time 0.026, grids per patch `(16,16,48)`, `(32,32,96)`, `(64,64,192)`
   give uniform-state combined L1 errors approximately `7.6e-5`, `2.2e-5`, `6.1e-6`.
   Maximum near-edge errors are `4.58e-4`, `1.90e-4`, `8.42e-5` respectively.
-- Odd MPI size, AMR and CT are rejected. Changed restart MPI size, missing sidecars
+- The November 16 fixed-grid build rejected odd MPI size, AMR and CT. Changed restart MPI size, missing sidecars
   and inconsistent sidecar timestamps are tested failures.
 - An optimized four-rank `(32,32,96)`-per-patch, 100-step run completes. This is a
   local timing observation, not a scaling result or a speedup versus spherical.

@@ -1,7 +1,7 @@
 module mod_usr
   use mod_mhd
   use mod_physics, only: phys_to_conserved
-  use mod_mhd_phys, only: mhd_ct_sync_center,mhd_face_to_center
+  use mod_mhd_phys, only: mhd_ct_sync_center,mhd_face_to_center,mhd_internal_e
   use mod_yinyang, only: yy_ct_patch_plan,yy_prepare_ct_patch,yy_sync_ct_edges,yy_ordered_ct_edges, &
     yy_ct_stage_plan,yy_prepare_ct_edges,yy_ct_edge_is_owner,yy_ct_ghost_plan,yy_prepare_ct_ghosts, &
     yy_fill_ct_ghosts,yy_sync_ct_faces,yy_ordered_ct_ghosts,yy_basis,yy_complete_ct_faces,yy_sync_ct_state
@@ -382,7 +382,8 @@ contains
     double precision function thermal_at(s,i,j,k) result(v)
       type(state),intent(in) :: s
       integer,intent(in) :: i,j,k
-      v=s%w(i,j,k,e_)-0.5d0*sum(s%w(i,j,k,mag(:))**2)-0.5d0*sum(s%w(i,j,k,mom(:))**2)/s%w(i,j,k,rho_)
+      v=s%w(i,j,k,e_)
+      if(.not.mhd_internal_e) v=v-0.5d0*sum(s%w(i,j,k,mag(:))**2)-0.5d0*sum(s%w(i,j,k,mom(:))**2)/s%w(i,j,k,rho_)
     end function
     double precision function coded_edge(gi,c,owner) result(v)
       integer,intent(in) :: gi(3),c,owner(3)

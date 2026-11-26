@@ -1,0 +1,62 @@
+&filelist
+ base_filename='ct'
+ autoconvert=.false.
+/
+&savelist
+ itsave(1,1)=0
+ itsave(1,2)=0
+ ditsave_log=1
+ ditsave_dat=1000
+/
+&stoplist
+ it_max=24
+/
+&methodlist
+ ct_stage_split=T
+ time_stepper='threestep'
+ flux_scheme=20*'hll'
+ limiter=20*'woodward'
+/
+&boundlist
+ typeboundary_min1=5*'special',3*'cont'
+ typeboundary_max1=8*'cont'
+ typeboundary_min2=8*'pole'
+ typeboundary_max2=8*'pole'
+ typeboundary_min3=8*'periodic'
+ typeboundary_max3=8*'periodic'
+/
+&meshlist
+ max_blocks=128
+ refine_max_level=1
+ block_nx1=8
+ block_nx2=8
+ block_nx3=8
+ domain_nx1=16
+ domain_nx2=32
+ domain_nx3=64
+ xprobmin1=1.d0
+ xprobmax1=2.d0
+ xprobmin2=0.d0
+ xprobmax2=0.5d0
+ xprobmin3=0.d0
+ xprobmax3=1.d0
+/
+&paramlist
+ dtpar=0.00025d0
+ courantpar=0.3d0
+/
+&mhd_list
+ mhd_internal_e=T
+ mhd_gravity=T
+ typedivbfix='ct'
+ type_ct='uct_hll'
+ boundary_divbfix=6*.false.
+/
+
+&eos_list
+ gamma=1.05d0
+/
+&radial_test
+ native=T
+ drive=0
+/

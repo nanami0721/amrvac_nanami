@@ -2,10 +2,13 @@
 """Build/run the experimental Yin-Yang CT weak-loop transport in an external source copy."""
 import argparse,hashlib,json,os,shutil,subprocess,sys
 from pathlib import Path
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('workdir',type=Path);p.add_argument('--radius',type=float,default=.35);p.add_argument('--radial-min',type=float,default=1.);p.add_argument('--radial-max',type=float,default=2.);p.add_argument('--resume',action='store_true');p.add_argument('--seam-pair',action='store_true');p.add_argument('--pilot',action='store_true');p.add_argument('--cache-source',type=Path,required=True);a=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('workdir',type=Path);p.add_argument('--radius',type=float,default=.35);p.add_argument('--radial-min',type=float,default=1.);p.add_argument('--radial-max',type=float,default=2.);p.add_argument('--resume',action='store_true');p.add_argument('--seam-pair',action='store_true');p.add_argument('--pilot',action='store_true');p.add_argument('--cache-source',type=Path,required=True)
+p.add_argument('--internal-energy',action='store_true',help='evolve internal energy in the staggered-field transport test')
+a=p.parse_args()
 s=Path(__file__).resolve().parents[3];r=a.workdir.resolve();b=r/'source'
 if r==s or s in r.parents:p.error('external directory required')
 geometry=dict(radius=a.radius,radial_min=a.radial_min,radial_max=a.radial_max)
+if a.internal_energy: geometry['internal_energy']=True
 assert 0<a.radial_min<1.5-a.radius and (1.5**2+.3**2)**.5+a.radius<a.radial_max,'analytic support must stay inside shell'
 if not a.resume:
  r.mkdir(parents=True,exist_ok=False)
@@ -40,6 +43,8 @@ def job(name,cmd,cwd,limit=1024):
  if proc.returncode:raise SystemExit(proc.returncode)
 compiler='F90=mpif90 --param ggc-min-expand=5 --param ggc-min-heapsize=4096'
 par=(s/'tests/yinyang/ct_preflight/amrvac.par').read_text()
+if a.internal_energy:
+ par=par.replace('&mhd_list','&mhd_list\n mhd_internal_e=T')
 par=par.replace('xprobmin1=1.d0',f'xprobmin1={a.radial_min}').replace('xprobmax1=2.d0',f'xprobmax1={a.radial_max}')
 par=par.replace('it_max=5','it_max=300').replace('ditsave_dat=5','ditsave_dat=1000')
 par=par.replace('&methodlist','&methodlist\n ct_stage_split=T\n yy_ct_experimental=T').replace("20*'minmod'","20*'vanleer'")
