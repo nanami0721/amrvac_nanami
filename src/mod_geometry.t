@@ -88,6 +88,7 @@ contains
       z_=-1
       coordinate=yinyang
       yinyang_enabled=.true.
+      ghostcell_sibling_recv_buffer=.true.
     case ("spherical","spherical_2D","spherical_3D")
       ndir = ndim
       r_   = 1
